@@ -15,10 +15,12 @@ COPY selector /app/selector
 COPY maps /app/maps
 COPY tools /app/tools
 
-# Bytecode for everything the run imports (the run-time disk is read-only), and the
-# fingerprint of what importing the pinned sqlglot computes (see selector/state.py).
+# Bytecode for everything the run imports (the run-time disk is read-only), the module
+# list and import graph of the pinned sqlglot (see selector/state.py), and the maps
+# unpacked for fast loading.
 RUN python -m compileall -q /app/src/sqlglot /app/src/tests /app/selector \
     && python /app/tools/build_state.py /app/src /app/maps/state.json.z \
+    && python /app/tools/pack_maps.py /app/maps \
     && chmod -R a+rX /app
 
 # The run has 2 cores and a cap on processes/threads: numeric libraries must not start

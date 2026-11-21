@@ -98,6 +98,100 @@ def run_one(test: dict, root: str, tmp_base: str) -> dict:
     return rec
 
 
+def _setup_reads(root: str):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for extra in (here, os.path.normpath(os.path.join(here, "..", "..", "selector")),
+                  os.path.normpath(os.path.join(here, "..", ".."))):
+        if extra not in sys.path:
+            sys.path.insert(0, extra)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    os.chdir(root)
+    os.environ["PYTHONPATH"] = f"{root}:{here}"
+    os.environ.setdefault("SKIP_INTEGRATION", "0")
+    os.environ.pop("BR_TRACE_SUBDIR", None)
+
+
+def run_reads(test: dict, root: str) -> dict:
+    """Runs in the forked child: which entries of sqlglot's tables does this test read?"""
+    _setup_reads(root)
+    import brtrace
+    import readtrace
+
+    readtrace.install(root)
+    tracer = brtrace.Tracer(root, reads=True)
+    tracer.start()
+    import brh
+
+    rec: dict = {"n": test["number"], "id": test["id"]}
+    try:
+        brh.install()
+        brh.load_case(test["id"])
+    except BaseException as e:  # noqa: BLE001
+        rec["error"] = f"import: {type(e).__name__}: {e}"
+        return rec
+    c0 = os.times()
+    failed = brh.run_tests([test["id"]])
+    c1 = os.times()
+    rec["ok"] = not failed
+    rec["problems"] = list(failed.values())[:2]
+    rec["reads"] = readtrace.snapshot()
+    rec["t_run_cpu"] = (c1.user - c0.user) + (c1.system - c0.system)
+    return rec
+
+
+def all_tables(root: str) -> list[str]:
+    """Runs in a forked child: every table path the package defines."""
+    _setup_reads(root)
+    import brtrace
+    import readtrace
+
+    readtrace.install(root)
+    tracer = brtrace.Tracer(root, reads=True)
+    tracer.start()
+    from selector import state as st
+
+    st.import_all(st.module_names())
+    return sorted({p for paths in readtrace.REG.values() for p in paths})
+
+
+def main_reads(args):
+    tests = json.load(open(args.tests))["tests"]
+    i, n = (int(x) for x in args.shard.split("/"))
+    order = sorted(tests, key=lambda t: -t["seconds"])
+    if args.only:
+        want = set(args.only.split(","))
+        order = [t for t in order if t["id"] in want or str(t["number"]) in want]
+    tests = [t for k, t in enumerate(order) if k % n == i]
+    import unittest  # noqa: F401
+    import numpy  # noqa: F401
+    import pandas  # noqa: F401
+    import duckdb  # noqa: F401
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, here)
+    import readtrace
+
+    t0 = time.time()
+    count = readtrace.precompile(args.root)
+    sys.stderr.write(f"[{args.shard}] rewrote {count} files in {time.time()-t0:.0f}s\n")
+    out = []
+    if i == 0:
+        out.append({"tables": _fork_collect(lambda: all_tables(args.root))})
+    for k, test in enumerate(tests):
+        rec = _fork_collect(lambda: run_reads(test, args.root))
+        out.append(rec if rec is not None else {"n": test["number"], "id": test["id"], "error": "no result"})
+        if k % 50 == 0:
+            sys.stderr.write(f"[{args.shard}] {k}/{len(tests)} {time.time()-t0:.0f}s\n")
+            sys.stderr.flush()
+    with open(args.out, "wb") as f:
+        pickle.dump(out, f)
+    bad = [r for r in out if "id" in r and (r.get("error") or not r.get("ok"))]
+    sys.stderr.write(f"[{args.shard}] done {len(out)} records, {len(bad)} not ok, {time.time()-t0:.0f}s\n")
+    for r in bad[:15]:
+        sys.stderr.write(f"   {r['id']}: {r.get('error') or r.get('problems')}\n")
+
+
 def _fork_collect(fn):
     """Run fn() in a forked child and return what it returns (pickled through a file)."""
     path = f"/tmp/brtrace_res_{os.getpid()}_{time.monotonic_ns()}.pkl"
@@ -194,6 +288,92 @@ def run_entries(test: dict, root: str) -> list[dict]:
     return out
 
 
+def run_units(test: dict, root: str) -> list[dict]:
+    """Trace a test method one unit at a time ("probes"; units come from stmt_spec.py).
+
+    Runs in a child that has imported the test module; every probe is a further fork that
+    reduces the method to the units that are always kept plus one independent unit, so
+    its record holds what that unit needs on its own. Probe `base` runs the kept units only."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, here)
+    sys.path.insert(0, os.path.normpath(os.path.join(here, "..", "..", "selector")))
+    sys.path.insert(0, root)
+    os.chdir(root)
+    os.environ["PYTHONPATH"] = f"{root}:{here}"
+    os.environ.setdefault("SKIP_INTEGRATION", "0")
+    os.environ.pop("BR_TRACE_SUBDIR", None)
+
+    import brtrace
+
+    tracer = brtrace.Tracer(root)
+    tracer.start()
+    import brh
+
+    brh.install()
+    brh.load_case(test["id"])
+    units = test["units"]
+
+    def spans_of(unit):
+        return [[unit[k], unit[k + 1]] for k in range(1, len(unit), 2)]
+
+    base = sorted(s for u in units if not u[0] for s in spans_of(u))
+
+    def probe(extra, label: str):
+        def body():
+            tracer.reset()
+            brh.KEEP_STATEMENTS[test["id"]] = sorted(base + extra)
+            c0 = os.times()
+            failed = brh.run_tests([test["id"]])
+            c1 = os.times()
+            tracer.active = False
+            rec = {"n": test["number"], "id": test["id"], "probe": label, "filter": {}}
+            rec.update(tracer.snapshot())
+            rec["ok"] = not failed and not brh.UNVERIFIED
+            rec["problems"] = list(failed.values())[:2] + [f"unverified {u}" for u in brh.UNVERIFIED[:1]]
+            rec["t_run_cpu"] = (c1.user - c0.user) + (c1.system - c0.system)
+            rec["modules_at_end"] = _mods()
+            rec["sub"] = None
+            return rec
+
+        return _fork_collect(body)
+
+    out = []
+    if base:
+        rec = probe([], "base")
+        if rec is None:
+            return out
+        out.append(rec)
+    for k, unit in enumerate(units):
+        if unit[0]:
+            rec = probe(spans_of(unit), f"@unit#{k}")
+            if rec is not None:
+                out.append(rec)
+    return out
+
+
+def main_units(args):
+    spec = json.load(open(args.units))
+    jobs = [dict(v, id=k) for k, v in sorted(spec.items(), key=lambda kv: -len(kv[1]["units"]))]
+    i, n = (int(x) for x in args.shard.split("/"))
+    jobs = [j for k, j in enumerate(jobs) if k % n == i]
+    import unittest  # noqa: F401
+    import numpy  # noqa: F401
+    import pandas  # noqa: F401
+    import duckdb  # noqa: F401
+
+    out = []
+    t0 = time.time()
+    for job in jobs:
+        recs = _fork_collect(lambda: run_units(job, args.root)) or []
+        out.extend(recs)
+        bad = sum(1 for r in recs if not r["ok"])
+        sys.stderr.write(f"[{args.shard}] {job['id']}: {len(recs)} probes, {bad} not ok, {time.time()-t0:.0f}s\n")
+        sys.stderr.flush()
+    with open(args.out, "wb") as f:
+        pickle.dump(out, f)
+    sys.stderr.write(f"[{args.shard}] done {len(out)} probes {time.time()-t0:.0f}s\n")
+
+
 def main_entries(args):
     jobs = json.load(open(args.entries))
     i, n = (int(x) for x in args.shard.split("/"))
@@ -219,6 +399,8 @@ def main_entries(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--entries", default="", help="JSON list of fixture-driven tests to trace per entry")
+    ap.add_argument("--units", default="", help="output of stmt_spec.py: trace these tests one unit at a time")
+    ap.add_argument("--reads", action="store_true", help="record table reads (readtrace.py) instead of coverage")
     ap.add_argument("--root", required=True)
     ap.add_argument("--tests", required=True)
     ap.add_argument("--out", required=True)
@@ -229,6 +411,10 @@ def main():
     args = ap.parse_args()
     if args.entries:
         return main_entries(args)
+    if args.units:
+        return main_units(args)
+    if args.reads:
+        return main_reads(args)
 
     tests = json.load(open(args.tests))["tests"]
     if args.jobs:
