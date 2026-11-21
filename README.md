@@ -16,10 +16,18 @@ CPU time. This entry does both, in that order:
    change is classified as *call-time* (inside a function body: which statement of which
    function) or *import-time* (module or class level). Comment-only, whitespace-only and
    annotation-only edits compare equal and cost nothing.
-2. **Look the change up in maps of the pinned commit** (`selector/plan.py`) to get the tests
+2. **Drop changes that cannot alter any run** (`selector/ident.py`). Turning `a is b` into
+   `a == b` (or `is not` into `!=`) changes nothing when the two operators agree for every
+   pair of objects that reaches the comparison: one side is None and the other side's class
+   never equals None, both are members of one enumeration, either class compares by
+   identity, and so on. A map lists, for each identity comparison of the package, the pairs
+   of operand classes the pinned test suite produces there and how each class compares for
+   equality; if all pairs are of that kind the patched program does exactly what the pinned
+   one does, test by test, and nothing is selected or re-run for that change.
+3. **Look the change up in maps of the pinned commit** (`selector/plan.py`) to get the tests
    it could affect: statement-level coverage for call-time changes; for fixture files the
    tests that load them and the entries that changed (`selector/fixtures.py`).
-3. **Measure import-time changes instead of guessing** (`selector/state.py`,
+4. **Measure import-time changes instead of guessing** (`selector/state.py`,
    `selector/statecands.py`). A child process imports the patched tree and fingerprints
    every module-level name and class attribute; comparing that with the same fingerprint
    of the pinned tree gives the definitions the change really altered, including derived
@@ -39,7 +47,7 @@ CPU time. This entry does both, in that order:
    that compares the import state or re-runs the candidates, or in a child of its own when
    nothing is re-run) and selects every test that loads a module that does not, and every
    test of a test file that cannot be imported.
-4. **Re-run the candidates against the patched tree** (`selector/verify.py`) and keep the
+5. **Re-run the candidates against the patched tree** (`selector/verify.py`) and keep the
    ones that fail. The patched tree is a symlink farm over the read-only checkout, the run
    happens in a forked child, and it is kept cheap by:
    * re-running fixture-driven tests (`check_file`, TPC-H/TPC-DS, `identity.sql` ...) on
@@ -53,12 +61,12 @@ CPU time. This entry does both, in that order:
      process and the affected function objects get the patched code (`verify.apply_swaps`);
      for patches that change no Python code the pinned modules are used as they are;
    * stopping early once the outcome can no longer change the selection.
-5. **A candidate that was not settled is selected.** Settled means re-run whole, or on
+6. **A candidate that was not settled is selected.** Settled means re-run whole, or on
    every affected fixture entry / unit. The one exception is the short list in
    `tools/never_alone.json`: three tests that cost more to re-run than to select, and that
    were measured never to fail on their own (see "How this was checked"). They are left out
    when the change is call-time only and every other candidate was settled and passed.
-6. **Add the tests that fail because of another test.** `TestOptimizer` makes one process
+7. **Add the tests that fail because of another test.** `TestOptimizer` makes one process
    pool for the whole class and 22 of its tests use it. A pool breaks for good when a worker
    cannot unpickle a call, or the parent cannot unpickle a result or a raised exception, and
    from then on every test using it fails with `BrokenProcessPool`, whether or not it runs
@@ -68,7 +76,7 @@ CPU time. This entry does both, in that order:
    touches code that runs while pools pickle (the serialiser, the expression and exception
    classes, and whatever else was seen running at such a moment on the pinned commit), the
    pool-using tests that come after it in the suite's order are selected as well.
-7. **Split** the selected tests over workers to minimise `largest load + 2 s x workers`
+8. **Split** the selected tests over workers to minimise `largest load + 2 s x workers`
    (`selector/split.py`).
 
 Anything the planner cannot analyse (binary patches, hunks that do not apply, changes to
@@ -80,16 +88,18 @@ is the import of the patched tree that does not come back).
 
 All maps are derived from the pinned commit only, by running its own test suite under a
 tracer or by reading its source. They describe that commit (what each test executes, reads
-and costs) and contain no patches, no outcomes of edits and no expected failures. Which
-tests fail on a patch is decided at run time by running them on the patched code; the one
-decision made without running anything is "this change cannot alter any run", and it is
-made only for comments, whitespace and annotations.
+and costs; what classes of objects meet where) and contain no patches, no outcomes of
+edits and no expected failures. Which tests fail on a patch is decided at run time by
+running them on the patched code; the one decision made without running anything is "this
+change cannot alter any run" (comments, annotations, and the identity comparisons of
+step 2), and that is reasoned from the patch and the maps when the patch arrives.
 
 | file | content | built by |
 | --- | --- | --- |
 | `maps/map.json.z` | per test: lines executed (split into import time / test time), modules loaded, classes instantiated, words and token types of the SQL it tokenizes or generates, files read, CPU cost | `tools/tracer/run_trace.py`, `time_tests.py`, `time_suite.py`, `tools/build_map.py` |
 | `maps/pmap.json.z` | the same per fixture entry of every fixture-driven test, and per unit of every long test method | `tools/tracer/run_trace.py --entries` / `--units`, `tools/build_map.py --probes` |
 | `maps/reads.json.z` | per test: which entries of sqlglot's class-level and module-level dicts and sets it looks up, tests for size, or walks | `tools/tracer/run_trace.py --reads` (`tools/tracer/readtrace.py`), `tools/build_map.py --reads` |
+| `maps/cmp.json.z` | per `is` / `is not` comparison in the package: the pairs of operand classes the suite produces there, and per class how it compares for equality (by identity, as a built-in value type, only with its own exact class, never with None, unknown) | `tools/tracer/cmptrace.py`, `tools/build_cmp.py` |
 | `maps/timp.json.z` | functions of the package that the module-level code of test files runs (what that computes stays in the test module, outside the import-state comparison) | `tools/tracer/timp.py` |
 | `maps/pools.json.z` | which tests submit calls to a process pool made in a class fixture, and which functions of the package run while a pool pickles or unpickles calls and results | `tools/tracer/pools.py` |
 | `maps/idents.json.z` | where each module-level / class-level name is used in the source | `tools/build_idents.py` |
@@ -109,6 +119,18 @@ identity, so a table reached through another name is still the same table. A con
 rewriter does not know counts as reading the whole table. A copy made while a test runs
 (`dict(table)`: the generator's dispatch table is built that way from `TRANSFORMS`) stands
 for the table it was copied from, so lookups in the copy are recorded as lookups in the table.
+
+The identity-comparison map is a third trace of the same kind (`tools/tracer/cmptrace.py`):
+each `a is b` in the package is rewritten to record the classes of `a` and `b`, in one
+process per test and once more with the whole suite in one process. Nothing but the
+original `is` is evaluated. Comparisons inside `__eq__`, `__hash__` and the like are left
+out, because there `==` could re-enter the method a patch changes. How a class compares
+is read off the class: `object.__eq__`, the `__eq__` of a built-in type, or an `__eq__`
+of the package whose source has the shape `self is other or (type(self) is type(other)
+and ...)`. Two more `__eq__` methods of the package (the dialect class and its metaclass)
+were read by hand and are listed in the tracer with a fingerprint of their source: they
+only equal strings and dialects. Every other class counts as unknown, and a comparison that sees one is
+handled like any other change.
 
 The traced maps are committed because tracing 1620 tests in isolation, plus 13,000 fixture
 entries and units, takes longer than the build allows. To rebuild them, inside the image:
@@ -132,6 +154,9 @@ python $T/run_trace.py --root /app/src --tests tests.json --reads --out /tmp/rea
 python /app/tools/build_map.py --tests tests.json --out maps/map.json.z --timing /tmp/timing \
     --classinfo /tmp/classinfo.json --never-alone tools/never_alone.json \
     --reads '/tmp/reads_*.pkl' --reads-out maps/reads.json.z /tmp/trace/shard_*.pkl
+python $T/cmptrace.py --root /app/src --tests tests.json --out /tmp/cmp_0.pkl
+python $T/cmptrace.py --root /app/src --tests tests.json --together --out /tmp/cmp_together.pkl
+python /app/tools/build_cmp.py --out maps/cmp.json.z '/tmp/cmp_*.pkl'
 python $T/timp.py --root /app/src --out maps/timp.json.z
 python $T/pools.py --root /app/src --tests tests.json --out maps/pools.json.z
 python /app/tools/build_idents.py /app/src maps/idents.json.z
@@ -165,6 +190,12 @@ at run time, except the three test names in `tools/never_alone.json`.
 * **Table-read map.** For 969 import-time trial edits (391 of them in generator tables),
   every test the read map removed from the candidates was re-run whole (12,462 runs) and
   passed.
+* **Identity comparisons.** A development pass of the tracer evaluated `==` next to each of
+  the 665 recorded `is` comparisons, in every test: of the 646 that tests execute, the
+  operators really disagree at 13, the rule calls 551 safe, and none of the 13 is among
+  those. All 675 patches that swap one such operator were planned: 545 are dropped, none
+  of them one where `==` differs. Twelve of the dropped ones (the six executed by most
+  tests, six at random) were also run under full `pytest`: nothing fails.
 * **Leaving a test out unsettled.** An earlier version left out any expensive test once
   enough cheaper candidates had passed. Trial edits showed that this is wrong for
   fixture-driven optimizer tests (they are often the only test to notice a change), so it

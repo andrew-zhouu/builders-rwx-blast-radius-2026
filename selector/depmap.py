@@ -56,6 +56,8 @@ class DepMap:
         self._outline: dict | None = None
         self._reads_path = os.path.join(os.path.dirname(path), "reads.json.z") if self.extra.get("reads") else None
         self._reads: dict | None = None
+        self._cmp_path: str | None = os.path.join(os.path.dirname(path), "cmp.json.z")
+        self._cmp: dict | None = None
         self._timp_path: str | None = os.path.join(os.path.dirname(path), "timp.json.z")
         self._timp: dict | None = None
         self._pools_path = os.path.join(os.path.dirname(path), "pools.json.z")
@@ -136,6 +138,24 @@ class DepMap:
             except (OSError, ValueError, KeyError):
                 self._reads_path = None
         return self._reads
+
+    def cmp(self) -> dict | None:
+        """Classes of the operands of the package's identity comparisons (tools/tracer/
+        cmptrace.py), or None when the map has no such record. "bad_bits": the tests
+        that could not be profiled, as a set of this map's tests."""
+        if self._cmp is None and self._cmp_path is not None:
+            try:
+                data = load(self._cmp_path)
+                bits = 0
+                for tid in data.get("bad", ()):
+                    i = self.index.get(tid)
+                    if i is not None:
+                        bits |= 1 << i
+                data["bad_bits"] = bits
+                self._cmp = data
+            except (OSError, ValueError, KeyError, zlib.error):
+                self._cmp_path = None
+        return self._cmp
 
     def run_by_test_imports(self, rel: str, lo: int, hi: int) -> bool:
         """Is code in rel:lo-hi run by the module-level code of a test module while it is

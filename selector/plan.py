@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import re
 
-from . import astdiff
+from . import astdiff, ident
 from .depmap import DepMap
 from .fixtures import plan_fixture
 from .patch import FilePatch, PatchError, apply_hunks
@@ -102,6 +102,8 @@ def _read(src_root: str, rel: str) -> str | None:
 
 # -- python files ------------------------------------------------------------
 CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+# Recognise operator swaps of identity comparisons that cannot change any outcome (ident.py).
+USE_IDENT = os.environ.get("BR_IDENT", "1") != "0"
 # Measure what import-time runs of a changed function body compute instead of selecting
 # every test whose imports run it.
 USE_IMPORT_RUNS = os.environ.get("BR_IMPORT_RUNS", "1") != "0"
@@ -187,6 +189,24 @@ def plan_python(dm: DepMap, plan: Plan, rel: str, old: str | None, new: str | No
         # module, and nothing in the tree inspects them at run time.
         kept = [ch for ch in changes if not ch.annotation]
         plan.note(f"{rel}: {len(changes) - len(kept)} annotation-only change(s) ignored")
+        changes = kept
+        if not changes:
+            return
+    if USE_IDENT and any(ch.ident for ch in changes):
+        cmp_map = dm.cmp()
+        kept = []
+        for ch in changes:
+            why = ident.same_outcome(cmp_map, rel, *ch.ident) if ch.ident else None
+            if why and cmp_map["bad_bits"] & dm.lines(rel, ch.lines[0], ch.lines[1], kinds=("run", "imp", "top")):
+                why = None      # a test running this code could not be profiled
+            if why:
+                plan.note(f"{rel}:{ch.ident[0]} {why}")
+                # Whatever else the commit changes is re-run against the complete patched
+                # tree (not from the pinned modules in memory): another change may bring
+                # objects to this comparison that the pinned suite never does.
+                plan.warm_ok = plan.hot_ok = False
+            else:
+                kept.append(ch)
         changes = kept
         if not changes:
             return

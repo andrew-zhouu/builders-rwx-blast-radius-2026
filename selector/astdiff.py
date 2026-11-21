@@ -50,7 +50,7 @@ class Change:
         self.top = None
         # (line, column) in the old file of an `a is b` / `a is not b` comparison whose
         # operator became `==` / `!=` with the operands left as they were, when that is
-        # the whole change (it is reported as one change at the comparison).
+        # the whole change (see ident.py).
         self.ident = None
 
     def __repr__(self):
