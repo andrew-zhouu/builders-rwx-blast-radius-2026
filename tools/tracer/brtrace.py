@@ -76,6 +76,24 @@ class _Loader:
         return getattr(self._inner, name)
 
 
+class _ReadLoader(_Loader):
+    """Like _Loader, but runs the module's rewritten code (readtrace.instrument)."""
+
+    def exec_module(self, module):
+        import readtrace
+
+        tr = self._tracer
+        tr._enter_import()
+        try:
+            path = self._inner.get_filename(module.__name__)
+            code = readtrace.CODE.get(path)
+            if code is None:
+                code = readtrace.CODE[path] = readtrace.instrument(self._inner.get_source(module.__name__), path)
+            exec(code, module.__dict__)
+        finally:
+            tr._exit_import(module)
+
+
 class _Finder:
     def __init__(self, tracer):
         self._tracer = tracer
@@ -85,12 +103,17 @@ class _Finder:
             return None
         spec = PathFinder.find_spec(name, path, target)
         if spec is not None and spec.loader is not None and hasattr(spec.loader, "exec_module"):
-            spec.loader = _Loader(spec.loader, self._tracer)
+            if self._tracer.reads and hasattr(spec.loader, "get_source"):
+                spec.loader = _ReadLoader(spec.loader, self._tracer)
+            else:
+                spec.loader = _Loader(spec.loader, self._tracer)
         return spec
 
 
 class Tracer:
-    def __init__(self, root: str):
+    def __init__(self, root: str, reads: bool = False):
+        # reads: record table reads (readtrace.py) instead of line coverage
+        self.reads = reads
         self.root = os.path.join(os.path.abspath(root), "")
         self._rel: dict[str, str | None] = {}
         self.run = Phase()
@@ -106,12 +129,24 @@ class Tracer:
     # -- phase handling ----------------------------------------------------
     def _enter_import(self):
         self.depth += 1
+        if self.reads:
+            import readtrace
+
+            readtrace.PHASE = "imp"
+            return
         if self.depth == 1:
             self.cur = self.imp
             mon.restart_events()
 
     def _exit_import(self, module):
         self.depth -= 1
+        if self.reads:
+            import readtrace
+
+            readtrace.register_module(module)
+            if self.depth == 0:
+                readtrace.PHASE = "run"
+            return
         if self.depth == 0:
             self.cur = self.run
             mon.restart_events()
@@ -217,6 +252,10 @@ class Tracer:
 
     # -- control -----------------------------------------------------------
     def start(self):
+        if self.reads:
+            sys.meta_path.insert(0, self._finder)
+            self.active = True
+            return
         mon.use_tool_id(TOOL, "brtrace")
         mon.register_callback(TOOL, mon.events.LINE, self._on_line)
         mon.register_callback(TOOL, mon.events.PY_START, self._on_start)
@@ -237,6 +276,12 @@ class Tracer:
 
     def stop(self):
         self.active = False
+        if self.reads:
+            try:
+                sys.meta_path.remove(self._finder)
+            except ValueError:
+                pass
+            return
         mon.set_events(TOOL, 0)
         mon.free_tool_id(TOOL)
         try:

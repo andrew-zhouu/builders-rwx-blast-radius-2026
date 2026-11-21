@@ -28,9 +28,13 @@ def main():
     ap.add_argument("--classinfo", default="")
     ap.add_argument("--light", default="", help="output of tracer/stmt_profile.py")
     ap.add_argument("--no-class-setup", default="", help="output of tracer/class_setup_check.py")
+    ap.add_argument("--never-alone", default="", help="JSON: tests measured never to fail on their own")
+    ap.add_argument("--reads", default="", help="glob of run_trace.py --reads shards")
+    ap.add_argument("--reads-out", default="", help="where to write the table-read map (reads.json.z)")
     ap.add_argument("--list-expensive", default="", help="write ids of tests costing > 1 s CPU here")
     ap.add_argument("--probes", action="store_true", help="build the per-fixture-entry map")
     ap.add_argument("--test-shards", default="", help="glob of whole-test shards (with --probes)")
+    ap.add_argument("--units", default="", help="output of tracer/stmt_spec.py (with --probes)")
     ap.add_argument("shards", nargs="+")
     a = ap.parse_args()
 
@@ -44,14 +48,35 @@ def main():
             for r in pickle.load(open(s, "rb")):
                 if r.get("filter") is None and not r.get("error"):
                     at_import[r["id"]] = (r["imp"]["lines"], r["imp"]["classes"])
+        # Tests traced one unit of their method at a time (ids "<test id>##@unit#<k>"): kept
+        # only when every probe of the test was traced and passed.
+        unit_spec = json.load(open(a.units)) if a.units else {}
+        unit_recs = {}
         for s in a.shards:
             for r in pickle.load(open(s, "rb")):
                 if r.get("probe") and not r["probe"].endswith("#all"):
                     lines, classes = at_import.get(r["id"], ((), ()))
                     r["imp"]["lines"] = list(r["imp"]["lines"]) + list(lines)
                     r["imp"]["classes"] = list(r["imp"]["classes"]) + list(classes)
-                    r["id"] = f"{r['id']}##{r['probe']}"
-                    recs[r["id"]] = r
+                    tid = r["id"]
+                    r["id"] = f"{tid}##{r['probe']}"
+                    if r["probe"].startswith("@unit#") or tid in unit_spec:
+                        unit_recs.setdefault(tid, []).append(r)
+                    else:
+                        recs[r["id"]] = r
+        units_kept = {}
+        for tid, rs in sorted(unit_recs.items()):
+            units = unit_spec[tid]["units"]
+            want = sum(u[0] for u in units) + (1 if any(not u[0] for u in units) else 0)
+            bad = [r for r in rs if r.get("error") or not r.get("ok")]
+            if len(rs) != want or bad:
+                print(f"   units dropped for {tid}: {len(rs)}/{want} probes, {len(bad)} not ok "
+                      f"{bad[0].get('problems') if bad else ''}")
+                continue
+            units_kept[tid] = units
+            for r in rs:
+                recs[r["id"]] = r
+        print(f"unit probes: {len(units_kept)} tests, {sum(sum(u[0] for u in v) for v in units_kept.values())} units")
         tests = [{"id": i, "seconds": 0.0} for i in sorted(recs)]
     else:
         tests = json.load(open(a.tests))["tests"]
@@ -225,6 +250,8 @@ def main():
         out["class_setup"] = {k: v for k, v in setup.items() if v}
         print("class setup costs:", out["class_setup"])
 
+    if a.probes:
+        out["extra"]["units"] = units_kept
     if a.classinfo:
         info = json.load(open(a.classinfo))
         out["extra"]["trackable"] = info["trackable"]
@@ -232,11 +259,61 @@ def main():
         out["extra"]["light"] = json.load(open(a.light))
     if a.no_class_setup:
         out["extra"]["no_class_setup"] = json.load(open(a.no_class_setup))
+    if a.never_alone:
+        out["extra"]["never_alone"] = json.load(open(a.never_alone))
     if a.list_expensive and "cpu" in out:
         with open(a.list_expensive, "w") as f:
             for t, c in zip(tests, out["cpu"]):
                 if c > 1.0:
                     f.write(t["id"] + "\n")
+
+    if a.reads and a.reads_out:
+        # Which entries of the package's dict / set valued tables each test reads
+        # (tracer/readtrace.py). Kept in a file of its own: it is only needed for changes
+        # to such tables. Its test sets index into this map's "sets".
+        r_all, r_size = defaultdict(int), defaultdict(int)
+        r_key: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        ok_bits = 0
+        tables: list[str] = []
+        n_bad = 0
+        for s in glob.glob(a.reads):
+            for r in pickle.load(open(s, "rb")):
+                if "tables" in r:
+                    tables = r["tables"] or tables
+                    continue
+                i = idx.get(r["id"])
+                if i is None:
+                    continue
+                # A test that failed while being observed, or that starts other interpreters
+                # (which are not observed), counts as reading everything.
+                if r.get("error") or not r.get("ok") or not r.get("reads") or (recs.get(r["id"]) or {}).get("n_sub"):
+                    n_bad += 1
+                    continue
+                bit = 1 << i
+                ok_bits |= bit
+                for ph in ("run", "imp"):
+                    d = r["reads"][ph]
+                    for pth in d["all"]:
+                        r_all[pth] |= bit
+                    for pth in d["size"]:
+                        r_size[pth] |= bit
+                    for pth, ks in d["key"].items():
+                        tab = r_key[pth]
+                        for k in ks:
+                            tab[k] |= bit
+        reads = {
+            "ok": sid(ok_bits),
+            "tables": sorted(tables),
+            "all": {k: sid(v) for k, v in sorted(r_all.items())},
+            "size": {k: sid(v) for k, v in sorted(r_size.items())},
+            "keys": {k: {kk: sid(vv) for kk, vv in sorted(v.items())} for k, v in sorted(r_key.items())},
+        }
+        raw_r = json.dumps(reads, separators=(",", ":")).encode()
+        with open(a.reads_out, "wb") as f:
+            f.write(zlib.compress(raw_r, 9))
+        out["extra"]["reads"] = True
+        print(f"table reads: {ok_bits.bit_count()} tests observed, {n_bad} not, {len(tables)} tables, "
+              f"{sum(len(v) for v in r_key.values())} (table, key) pairs, raw={len(raw_r)/1e6:.1f}MB")
 
     ordered = sorted(sets.items(), key=lambda kv: kv[1])
     out["sets"] = [format(bits, "x") for bits, _ in ordered]

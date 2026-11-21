@@ -15,26 +15,101 @@ import sys
 from concurrent.futures import Future
 
 
+# The test that is running (None between tests, e.g. in class fixtures).
+CURRENT: str | None = None
+# Calls submitted to a pool that outlives the test making them (one made in a class
+# fixture): {(test id, file of the submit call, line)}. Filled on every run; the map
+# builder (tools/tracer/pools.py) turns it into "which tests share a pool".
+SHARED_SUBMITS: set = set()
+# Tests during which a shared pool would have broken (see InlinePool.submit).
+POOL_BREAKS: list = []
+# Test files that could not be imported when one of their tests was asked for: {file: reason}.
+BAD_FILES: dict = {}
+# A profile function that is active while a pool pickles or unpickles (map building only:
+# tools/tracer/pools.py records with it which code runs then).
+PICKLE_TRACE = None
+
+
+def _pickling(step, data):
+    if PICKLE_TRACE is None:
+        return step(data)
+    sys.setprofile(PICKLE_TRACE)
+    try:
+        return step(data)
+    finally:
+        sys.setprofile(None)
+
+
 class InlinePool:
-    """Drop-in for ProcessPoolExecutor that runs submitted calls immediately."""
+    """Drop-in for ProcessPoolExecutor that runs submitted calls immediately.
+
+    A real pool breaks for good when a worker dies, and a worker dies when it cannot
+    unpickle the call it was sent; the pool also breaks when the parent cannot unpickle a
+    result or the exception a call raised. Every later test using the same pool then fails
+    with BrokenProcessPool, whatever it tests. Here the call fails the same way, and the
+    event is recorded (POOL_BREAKS) when the pool is shared between tests, so that the
+    selector can add the other tests using it. The pool itself keeps working: each test
+    re-run here is judged on its own, in whatever order."""
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_):
         self._initializer = initializer
         self._initargs = initargs
         self._ready = False
+        self._owner = CURRENT       # None: made outside any test, so shared between tests
+
+    def _site(self):
+        f = sys._getframe(2)
+        while f is not None and f.f_code.co_filename == __file__:
+            f = f.f_back
+        return (f.f_code.co_filename, f.f_lineno) if f is not None else ("?", 0)
+
+    def _broken(self, fut, shared):
+        from concurrent.futures.process import BrokenProcessPool
+
+        if shared and CURRENT is not None and CURRENT not in POOL_BREAKS:
+            POOL_BREAKS.append(CURRENT)
+        fut.set_exception(BrokenProcessPool(
+            "A process in the process pool was terminated abruptly while the future was running or pending."))
+        return fut
 
     def submit(self, fn, /, *args, **kwargs):
         fut: Future = Future()
+        shared = self._owner is None or self._owner != CURRENT
+        if shared and CURRENT is not None:
+            SHARED_SUBMITS.add((CURRENT,) + self._site())
         try:
             if not self._ready:
                 self._ready = True
                 if self._initializer is not None:
                     self._initializer(*self._initargs)
-            fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
-            result = fn(*args, **kwargs)
-            fut.set_result(pickle.loads(pickle.dumps(result)))
-        except Exception as e:  # noqa: BLE001 - a worker would send it back the same way
+            call = _pickling(pickle.dumps, (fn, args, kwargs))
+        except Exception as e:  # noqa: BLE001 - the call never leaves: only this future fails
             fut.set_exception(e)
+            return fut
+        try:
+            fn, args, kwargs = _pickling(pickle.loads, call)
+        except Exception:  # noqa: BLE001 - the worker dies reading the call
+            return self._broken(fut, shared)
+        try:
+            result = fn(*args, **kwargs)
+            result = _pickling(pickle.dumps, result)
+        except Exception as e:  # noqa: BLE001 - a worker sends it back as the call's outcome
+            # ... pickled like a result: what cannot be pickled is replaced by the error
+            # saying so, and what the parent cannot unpickle breaks the pool.
+            try:
+                sent = _pickling(pickle.dumps, e)
+            except Exception as e2:  # noqa: BLE001
+                fut.set_exception(e2)
+                return fut
+            try:
+                fut.set_exception(_pickling(pickle.loads, sent))
+            except Exception:  # noqa: BLE001
+                return self._broken(fut, shared)
+            return fut
+        try:
+            fut.set_result(_pickling(pickle.loads, result))
+        except Exception:  # noqa: BLE001 - the parent cannot read the result
+            return self._broken(fut, shared)
         return fut
 
     def map(self, fn, *iterables, **_):
@@ -120,6 +195,45 @@ def _light_method(case, meth: str, spans):
     return namespace[fdef.name]
 
 
+# test id -> [[first line, last line], ...]: the statements of the test method to run, in
+# file order (the others are left out). Used to re-run only the parts of a long test that
+# a change can reach; see tools/tracer/stmt_spec.py for which parts may be left out.
+KEEP_STATEMENTS: dict[str, list] = {}
+_SOURCE_LINES: dict[str, list[str]] = {}
+
+
+def _kept_method(case, meth: str, spans):
+    """The test method rebuilt from the given statement line spans of its source file."""
+    import inspect
+
+    func = getattr(type(case), meth)
+    if inspect.unwrap(func) is not func or not inspect.isfunction(func):
+        return None
+    code = func.__code__
+    lines = _SOURCE_LINES.get(code.co_filename)
+    if lines is None:
+        with open(code.co_filename, encoding="utf-8") as f:
+            lines = _SOURCE_LINES[code.co_filename] = f.read().split("\n")
+    body: list[str] = []
+    for lo, hi in spans:
+        if lo <= code.co_firstlineno or hi > len(lines):
+            return None
+        body.extend(lines[lo - 1:hi])
+    if not body:
+        return None
+    indent = len(body[0]) - len(body[0].lstrip(" "))
+    if indent < 8 or indent % 4:
+        return None
+    # The owning class is named in the stand-in so that private names are mangled alike.
+    owner = func.__qualname__.split(".")[-2] if "." in func.__qualname__ else type(case).__name__
+    pad = indent - 8
+    head = "".join(" " * (4 * d) + "if 1:\n" for d in range(pad // 4))
+    head += " " * pad + f"class {owner}:\n" + " " * (pad + 4) + f"def {meth}(self):\n"
+    namespace: dict = {}
+    exec(compile(head + "\n".join(body) + "\n", code.co_filename, "exec"), func.__globals__, namespace)
+    return namespace[owner].__dict__[meth]
+
+
 def find_function(filename: str, name: str, first_line: int):
     """The ast.FunctionDef called `name` that starts at `first_line` of the file."""
     import ast
@@ -140,6 +254,17 @@ def load_case(test_id: str):
     mod_name = file_part[:-3].replace("/", ".")
     module = __import__(mod_name, fromlist=[cls_name])
     case = getattr(module, cls_name)(meth)
+    keep = KEEP_STATEMENTS.get(test_id)
+    if keep is not None:
+        kept = None
+        try:
+            kept = _kept_method(case, meth, keep)
+        except Exception:  # noqa: BLE001
+            kept = None
+        if kept is None:
+            raise LightUnavailable(test_id)
+        setattr(case, meth, types.MethodType(kept, case))
+        return case
     spans = DROP_STATEMENTS.get(test_id)
     if spans:
         light = None
@@ -172,11 +297,21 @@ class _Result:
 
         class R(unittest.TestResult):
             def startTest(self, test):
+                global CURRENT
                 tid = getattr(test, "_br_id", None)
+                CURRENT = tid
                 if tid is not None:
                     outer.started.add(tid)
+                    if TIMES is not None:
+                        TIMES[tid] = -_cpu_now()
 
             def stopTest(self, test):
+                global CURRENT
+                CURRENT = None
+                if TIMES is not None:
+                    tid = getattr(test, "_br_id", None)
+                    if tid in TIMES and TIMES[tid] < 0:
+                        TIMES[tid] += _cpu_now()
                 # When the first few tests all fail the change is clearly live: stop and let
                 # the caller treat the rest as failing rather than pay to confirm it.
                 k = outer.stop_after
@@ -215,6 +350,16 @@ class _Result:
 
         suite.run(R())
         return self.failed
+
+
+# test id -> CPU seconds of its run, filled only when a dict is put here (analysis runs).
+TIMES: dict | None = None
+
+
+def _cpu_now() -> float:
+    import time
+
+    return time.process_time()
 
 
 DUCKDB_THREADS = 2
@@ -281,6 +426,10 @@ def run_tests(test_ids: list[str], stop_after: int = 0) -> dict[str, str]:
             failed[tid] = reason
             if not isinstance(e, AttributeError):   # the file itself cannot be imported
                 bad_files[file_part] = reason
+                if file_part[:-3].replace("/", ".") not in sys.modules:
+                    # ... for certain (a failed import leaves no module behind): then every
+                    # test of the file fails, not only the ones asked for.
+                    BAD_FILES[file_part] = reason
             continue
         case._br_id = tid
         klass = type(case)

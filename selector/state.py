@@ -28,6 +28,7 @@ SKIP_CLASS_ATTRS = frozenset((
     "__dataclass_fields__", "__dataclass_params__", "__type_params__",
 ))
 SCALARS = (bool, int, float, complex, str, bytes)
+VIEWS = (type({}.keys()), type({}.values()), type({}.items()))
 
 
 def _h(*parts) -> str:
@@ -127,10 +128,16 @@ class Fingerprinter:
             return _h("enum", _ref(t), v.name)
         if t is re.Pattern:
             return _h("re", v.pattern, v.flags)
+        if t in VIEWS:
+            # A live view of a dict (d.keys(), d.values(), d.items()): as good as its content.
+            return _h("view", t.__name__, *sorted(fp(x, d) for x in v))
         if t in (types.BuiltinFunctionType, types.MethodDescriptorType, types.WrapperDescriptorType,
                  types.MethodWrapperType, types.ClassMethodDescriptorType, types.GetSetDescriptorType,
                  types.MemberDescriptorType):
-            return _h("builtin", getattr(v, "__qualname__", ""), _ref(getattr(v, "__objclass__", t)))
+            # A bound method of a container (TABLE.get, ...) reads that container.
+            owner = getattr(v, "__self__", None)
+            bound = "" if owner is None or isinstance(owner, (types.ModuleType, type)) else fp(owner, d)
+            return _h("builtin", getattr(v, "__qualname__", ""), _ref(getattr(v, "__objclass__", t)), bound)
         mod = getattr(t, "__module__", "")
         if _in_repo(mod):
             parts = ["obj", _ref(t)]
@@ -148,6 +155,12 @@ class Fingerprinter:
                         parts.append(name + "=unset")
             return _h(*parts)
         if mod in ("typing", "types", "collections.abc", "datetime", "decimal", "fractions", "pathlib"):
+            return _h("repr", _ref(t), repr(v))
+        if mod == "logging" and isinstance(getattr(v, "name", None), str):
+            # A logger is the one registered under its name: tests that expect records on
+            # "sqlglot" notice when a module starts logging somewhere else.
+            return _h("logger", _ref(t), v.name)
+        if t in (range, slice):
             return _h("repr", _ref(t), repr(v))
         return _h("opaque", _ref(t))
 
@@ -319,6 +332,11 @@ def snapshot(only: set[str] | None = None) -> dict[str, str]:
         if isinstance(val, dict) and len(val) <= 5000:
             for k, x in val.items():
                 out[f"{base}|{_key(k)}"] = f.fp(x)
+        elif type(val) in (set, frozenset) and len(val) <= 5000:
+            # One entry per member, so that a changed member shows as one gone, one new.
+            for m in val:
+                simple = m is None or isinstance(m, (str, type, enum.Enum, bool, int, float))
+                out[f"{base}|{_key(m) if simple else 'h:' + f.fp(m)}"] = "member"
 
     def walk_class(cls, mname: str):
         q = cls.__qualname__

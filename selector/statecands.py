@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 
 from .depmap import DepMap
-from .plan import _class_keys, readers_of
+from .plan import _class_keys, readers_of, untracked_class_readers
 
 WORDS = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
 MAX_PATHS = 600
@@ -61,8 +61,33 @@ def _module_file(dm: DepMap, mod: str) -> str | None:
     return None
 
 
+def _by_reads(dm: DepMap, reads: dict, path: str, keys: set[str], added: set[str], removed: set[str]) -> int:
+    """Tests that read the changed entries of a table (or were not observed)."""
+    def tests(table: str) -> int:
+        sid = reads[table].get(path)
+        return dm.set(sid) if sid else 0
+
+    key_tab = reads["keys"].get(path, {})
+    readers = tests("all")
+    # Without entry-level information, or with keys whose spelling is not reproducible,
+    # every lookup counts; an entry that appears or disappears also changes the size.
+    any_key = not keys or any(not k.startswith(("s:", "c:", "e:", "v:")) for k in keys)
+    resized = any_key or any(f"{path}|{k}" in added or f"{path}|{k}" in removed for k in keys)
+    if any_key:
+        for sid in key_tab.values():
+            readers |= dm.set(sid)
+    else:
+        for k in keys:
+            sid = key_tab.get(k)
+            if sid:
+                readers |= dm.set(sid)
+    if resized:
+        readers |= tests("size")
+    return readers | (dm.all & ~reads["ok"])
+
+
 def from_paths(dm: DepMap, paths: list[str], added: set[str], failed: dict, facts: dict, cheap,
-               notes: list[str]) -> int | None:
+               notes: list[str], removed: set[str] = frozenset(), use_reads: bool = True) -> int | None:
     """Tests that can observe the changed definitions; None when the change is too wide
     to reason about (the caller keeps its conservative candidates).
 
@@ -113,8 +138,9 @@ def from_paths(dm: DepMap, paths: list[str], added: set[str], failed: dict, fact
         else:
             ckeys = _class_keys(mod, cls)
             if ckeys[0] not in dm.trackable:
+                readers = untracked_class_readers(dm, cls, readers)
                 cands = (readers[0] & users) | readers[1] if readers is not None else users
-                how = "untracked class"
+                how = "untracked class, readers of the name or of the class" if readers is not None else "untracked class"
             else:
                 # Expression nodes built while importing (templates) are copied before use,
                 # so only tests creating such nodes themselves depend on the class body.
@@ -128,6 +154,13 @@ def from_paths(dm: DepMap, paths: list[str], added: set[str], failed: dict, fact
             narrowed, why = _narrow(dm, f"{mod}.{cls or ''}", keys, cands)
             if why:
                 cands, how = narrowed, f"{how}, {why}"
+        reads = dm.reads() if use_reads else None
+        path = f"{mod}|g|{attr}" if cls is None else f"{mod}|c|{cls}|{attr}"
+        if reads is not None and path in reads["tables"] and not cheap(cands):
+            # A dict / set valued table whose reads were recorded test by test.
+            before = cands.bit_count()
+            cands &= _by_reads(dm, reads, path, keys, added, removed)
+            how = f"{how}, {cands.bit_count()} of {before} read the changed entries"
         notes.append(f"state: {mod} {cls or ''}.{attr} {sorted(keys)[:3]} -> {cands.bit_count()} ({how})")
         bits |= cands
     if failed:

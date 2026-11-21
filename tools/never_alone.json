@@ -1,0 +1,5 @@
+{
+  "tests/test_executor.py::TestExecutor::test_execute_tpcds": "21 s recorded, ~37 s CPU: too expensive to re-run or to select on spec. On 80 trial edits to code it runs, with every other candidate re-run, it failed 46 times and never as the only failing test.",
+  "tests/test_optimizer.py::TestOptimizer::test_tpcds": "Costs more CPU to re-run completely (~6.5 s) than to select. On 209 trial edits it failed 51 times and never as the only failing test.",
+  "tests/test_parser.py::TestParser::test_max_nodes": "29 s recorded, ~32 s CPU. On 42 trial edits to code it runs it failed 22 times, each time together with at least 130 other tests."
+}
