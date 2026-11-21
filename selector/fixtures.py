@@ -59,8 +59,9 @@ def plan_fixture(dm, plan, rel: str, old: str | None, new: str | None, src_root:
     readers = dm.openers(rel)
     direct = readers & ~loader_users   # tests reading the file some other way
     if old is None or new is None or helpers_changed or direct or not loader_users:
-        plan.warm_ok = False
+        plan.warm_ok = plan.hot_ok = False
         plan.add(readers | loader_users)
+        plan.whole_only |= readers | loader_users
         plan.note(f"{rel}: re-run {(readers | loader_users).bit_count()} readers in full")
         return
     changed: set[int] = set()
@@ -71,8 +72,9 @@ def plan_fixture(dm, plan, rel: str, old: str | None, new: str | None, src_root:
         try:
             before = load_entries(src_root, kind, old)
         except Exception:  # noqa: BLE001 - cannot reason about entries: re-run in full
-            plan.warm_ok = False
+            plan.warm_ok = plan.hot_ok = False
             plan.add(bits)
+            plan.whole_only |= bits
             continue
         try:
             after = load_entries(src_root, kind, new)

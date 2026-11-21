@@ -10,6 +10,7 @@ import ast
 from difflib import SequenceMatcher
 
 FUNC = (ast.FunctionDef, ast.AsyncFunctionDef)
+IDENTITY_SWAPS = ((ast.Is, ast.Eq), (ast.IsNot, ast.NotEq))
 BODY_FIELDS = ("body", "orelse", "finalbody", "handlers", "cases")
 
 
@@ -26,7 +27,7 @@ class Change:
     """
 
     __slots__ = ("kind", "lines", "cls", "target", "key", "func", "names", "note", "annotation",
-                 "side_effects")
+                 "side_effects", "top", "ident")
 
     def __init__(self, kind, lines, cls=None, target=None, key=None, func=None, names=(), note="",
                  annotation=False, side_effects=False):
@@ -44,6 +45,13 @@ class Change:
         # Import-time code that may do more than bind names (bare calls, loops, ...): its
         # effect cannot be read off the module's namespace.
         self.side_effects = side_effects
+        # For a change inside the body of a module- or class-level `def` (diff_region only):
+        # {"name", "cls", "col", "old": (first, last line), "new": (first, last line)} of that def.
+        self.top = None
+        # (line, column) in the old file of an `a is b` / `a is not b` comparison whose
+        # operator became `==` / `!=` with the operands left as they were, when that is
+        # the whole change (it is reported as one change at the comparison).
+        self.ident = None
 
     def __repr__(self):
         return (f"Change({self.kind}, lines={self.lines}, cls={self.cls}, target={self.target}, "
@@ -191,7 +199,8 @@ class Differ:
         return _dump(x)
 
     # -- reporting ---------------------------------------------------------
-    def report(self, ctx: _Ctx, old_node=None, new_node=None, note="", whole_func=False, span=None):
+    def report(self, ctx: _Ctx, old_node=None, new_node=None, note="", whole_func=False, span=None,
+               ident=None):
         names = _names_of(old_node, new_node)
         cls = ".".join(ctx.cls) if ctx.cls else None
         if ctx.scope == "call":
@@ -219,7 +228,8 @@ class Differ:
             ch = Change("import", lines, cls=cls, target=ctx.target, key=ctx.key, func=fn,
                         names=names, note=note, annotation=ctx.annotation,
                         side_effects=_side_effects(stmt) or _side_effects(new_node))
-        sig = (ch.kind, ch.lines, ch.cls, ch.target, ch.key, ch.annotation)
+        ch.ident = ident
+        sig = (ch.kind, ch.lines, ch.cls, ch.target, ch.key, ch.annotation, ident)
         if sig not in self._seen:
             self._seen.add(sig)
             self.changes.append(ch)
@@ -228,6 +238,11 @@ class Differ:
     def nodes(self, a, b, ctx: _Ctx):
         if type(a) is not type(b):
             self.report(ctx, a, b, note="node type")
+            return
+        if (isinstance(a, ast.Compare) and len(a.ops) == 1 and len(b.ops) == 1
+                and (type(a.ops[0]), type(b.ops[0])) in IDENTITY_SWAPS
+                and _dump(a.left) == _dump(b.left) and _dump(a.comparators[0]) == _dump(b.comparators[0])):
+            self.report(ctx, a, b, note="identity to equality", ident=(a.lineno, a.col_offset))
             return
         if isinstance(a, ast.Dict) and len(a.keys) == len(b.keys) and all(
             self.same(x, y) for x, y in zip(a.keys, b.keys)
@@ -397,6 +412,9 @@ def diff_region(old_src: str, new_src: str, edits: list, outline: dict) -> list[
         s_old, s_new = old_body[0], new_body[0]
         if s_old.col_offset != col or s_new.col_offset != col:
             return None
+        if all(isinstance(x, ast.Expr) and isinstance(x.value, ast.Constant) and isinstance(x.value.value, str)
+               for x in (s_old, s_new)):
+            continue    # a bare string (a docstring, or a statement without effect) was edited
         d = Differ(old_snip, new_snip)
         ctx = _Ctx()
         chain = classes[cls_idx]
@@ -406,10 +424,18 @@ def diff_region(old_src: str, new_src: str, edits: list, outline: dict) -> list[
         if not d.same(s_old, s_new):
             d.nodes(s_old, s_new, ctx)
         off = lo - 1 - pad
+        top = None
+        if type(s_old) is ast.FunctionDef and s_old.name == s_new.name:
+            top = {"name": s_old.name, "cls": chain, "col": col, "old": (lo, hi),
+                   "new": (lo + shift, hi + shift + grow)}
         for ch in d.changes:
             ch.lines = (ch.lines[0] + off, ch.lines[1] + off)
+            if ch.ident is not None:
+                ch.ident = (ch.ident[0] + off, ch.ident[1])
             if ch.func is not None:
                 ch.func = (ch.func[0], ch.func[1] + off, ch.func[2] + off)
+            if ch.kind in ("call", "func"):
+                ch.top = top
             changes.append(ch)
     return changes
 
