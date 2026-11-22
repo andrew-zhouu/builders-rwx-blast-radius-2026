@@ -78,6 +78,35 @@ EARLY_STOP = int(_f("BR_EARLY_STOP", 5))     # stop re-running once the first k 
 FIRST_FAIL_MARGIN_MS = _f("BR_FIRST_FAIL_MARGIN_MS", 2500)
 WARM = int(_f("BR_WARM", 1))                 # reuse pinned modules for patches that change no Python code
 HOT = int(_f("BR_HOT", 1))                   # replace function code in place for pure function-body changes
+# Leaving an expensive test out on the evidence of its neighbours (off by default; see
+# Selector.evidence_probe).
+RISK = int(_f("BR_RISK", 1))
+RISK_EXEC_S = _f("BR_RISK_EXEC_S", 1.0)      # evidence: the executor tests cheaper than this,
+RISK_OPT_S = _f("BR_RISK_OPT_S", 0.0)        # ... and the optimizer tests cheaper than this (0: none)
+RISK_ANY = int(_f("BR_RISK_ANY", 0))         # (for experiments: also for patches outside the package)
+RISK_IMPORT = int(_f("BR_RISK_IMPORT", 1))   # 0: no bet at all on a change to import-time code
+RISK_IMPORT_T = int(_f("BR_RISK_IMPORT_T", 0))  # (for experiments: the neighbour bet on import-time changes too)
+RISK_SAMPLE = int(_f("BR_RISK_SAMPLE", 30))  # this many of the cheapest other selected tests are evidence too
+RISK_VU = int(_f("BR_RISK_VU", 0))           # (for experiments: the neighbour bet after a re-run too)
+RISK_PROBE_S = _f("BR_RISK_PROBE", 12.0)     # getting the evidence may cost at most this much CPU
+RISK_MIN_EVIDENCE = int(_f("BR_RISK_MIN_EVIDENCE", 3))   # ... and it takes at least this many passing neighbours
+RISK_TESTS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",
+              "tests/test_parser.py::TestParser::test_max_nodes")
+RISK_EXEC = "tests/test_executor.py::TestExecutor::"
+# The expensive parser test builds one statement of a million nodes and expects the parser to
+# refuse it at limits of 1,000,000 and of 50,000 nodes. The stand-in is the same test method
+# with a statement a hundredth as wide (some 12,000 nodes) and limits of 4,000 and 5,000.
+RISK_SCALE = int(_f("BR_RISK_SCALE", 1))
+RISK_SCALE_S = _f("BR_RISK_SCALE_S", 0.8)     # the stand-in takes 0.3 s of CPU on the pinned commit
+RISK_SCALED = {
+    "tests/test_parser.py::TestParser::test_max_nodes": [
+        ["        width = 10000" + chr(10), "        width = 100" + chr(10)],
+        ["            parse_one(sql, max_nodes=1_000_000)" + chr(10), "            parse_one(sql, max_nodes=4_000)" + chr(10)],
+        ["            parse_one(sql, max_nodes=50_000)" + chr(10), "            parse_one(sql, max_nodes=5_000)" + chr(10)],
+        ['self.assertIn("(50000)", str(ctx.exception))', 'self.assertIn("(5000)", str(ctx.exception))'],
+    ],
+}
+RISK_OPT = "tests/test_optimizer.py::TestOptimizer::"
 USE_STATE = int(_f("BR_USE_STATE", 1))       # measure what import-time changes alter (state.py)
 STATE_MIN_S = _f("BR_STATE_MIN", 1.2)        # ... when re-running the static candidates costs more than this
 STATE_IMPORT_LIMIT_S = int(_f("BR_STATE_IMPORT_LIMIT", 30))   # ... and the most that importing and comparing may take
@@ -144,6 +173,8 @@ class Selector:
         self._base_scope: set = set()      # ... the modules it covers
         self._plans: dict = {}             # commit path -> (files, plan) or the exception planning raised
         self._meth: list | None = None     # method name of each test of the map
+        self._plan = None                  # the plan of the commit being handled (evidence_probe)
+        self._class_bits: dict | None = None
         # tests known not to use their class-level fixtures (map index)
         self.no_setup = {self.dm.index[t] for t in self.dm.extra.get("no_class_setup", ())
                          if t in self.dm.index}
@@ -928,6 +959,11 @@ class Selector:
         if extra or breakers:
             selected |= extra
             info["pool"] = [breakers.bit_count(), extra.bit_count()]
+        if RISK:
+            settled = ran & ~failed_bits & ~unsettled & ~stopped
+            # (seen failing: not the ones only assumed to fail after an early stop)
+            info["_failed"] = [self.num[i] for i in dm.ids(failed_bits & ~stopped) if self.num[i] is not None]
+            info["_passed"] = [self.num[i] for i in dm.ids(settled) if self.num[i] is not None]
         out = self.durations(selected)
         if out:
             for n in self.unknown:
@@ -935,7 +971,193 @@ class Selector:
         info["decision"] = decision
         return best_split(out)[1]
 
+    # -- leaving an expensive test out on evidence (BR_RISK) ----------------------------------
+    def evidence_probe(self, plan, workers, info: dict, k: int):
+        """Two tests cost 21 s and 29 s to select and more than that to re-run. When one of them
+        is in the selection without having been seen to fail, cheaper evidence is gathered:
+
+        * the parser test (a statement of a million nodes has to be refused) is run in a
+          scaled-down form, RISK_SCALED, and has to pass in about the time that takes on the
+          pinned commit;
+        * for the executor's TPC-DS test, only when the commit was decided without a re-run
+          and only call-time code changed: the selected cheap tests of its class and the
+          cheapest of the other selected tests are re-run, unless an executor or optimizer
+          test is already known to fail.
+
+        A test whose evidence passes is taken out of the selection; everything else stays.
+        This is a bet, not a proof: see the README for how it did on trial edits."""
+        selected = {n for w in workers for n in w}
+        if not selected:
+            return workers
+        decision = str(info.get("decision"))
+        if decision.startswith("all") or "hang" in decision or info.get("import_failed") or info.get("bad_files"):
+            return workers
+        # Only for changes to the package's own code: the evidence says nothing about a test
+        # whose own code or data (tests/, fixtures, other files) was changed.
+        if not RISK_ANY and (not plan.changed or any(not (f.startswith("sqlglot/") and f.endswith(".py")) or text is None
+                                                     for f, text in plan.changed.items())):
+            return workers
+        if not RISK_IMPORT and (not plan.all_call_time or info.get("state")):
+            return workers
+        dm = self.dm
+        failed = set(info.get("_failed") or ())
+        passed = set(info.get("_passed") or ())
+        index_of = {n: i for i, n in enumerate(self.num) if n is not None}
+        name = {n: dm.tests[i] for n, i in index_of.items()}
+        big = {self.num[dm.index[t]] for t in RISK_TESTS if t in dm.index}
+        unsure = (big & selected) - failed
+        if not unsure:
+            return workers
+        report: dict = {"unsure": len(unsure)}
+        info["risk"] = report
+        # -- which evidence to gather
+        scaled = sorted(n for n in unsure if RISK_SCALE and name[n] in RISK_SCALED)
+        by_neighbours = unsure - set(scaled)
+        todo: list = []
+        if by_neighbours and not RISK_VU and decision.split("(")[0] != "blind":
+            # After a re-run of the other candidates the expensive test is one of the few
+            # tests left that could notice the change: there the neighbours were wrong too often.
+            by_neighbours = set()
+            report["neighbours"] = "not asked"
+        if by_neighbours and (not plan.all_call_time or info.get("state")):
+            # A change to what importing a module does: when it could not be worked out which
+            # tests use the changed definitions, tests can depend on what ran before them in
+            # the suite, and a run of a few tests on their own does not show that.
+            notes = info.get("notes") or ()
+            if not RISK_IMPORT_T or any("module users" in n or "uses unknown" in n for n in notes):
+                by_neighbours = set()
+                report["neighbours"] = "not asked (import time)"
+        if by_neighbours:
+            never = {self.num[i] for i in dm.ids(self.never_alone)}
+            both = {n for n in index_of if name[n].startswith((RISK_EXEC, RISK_OPT))}
+            evidence = set()
+            for n in both - never:
+                limit = RISK_EXEC_S if name[n].startswith(RISK_EXEC) else RISK_OPT_S
+                if self.ms[n] < limit * 1000:
+                    evidence.add(n)
+            todo = sorted((evidence & selected) - passed)
+            # ... and the cheapest of the other selected tests: when they fail, the change
+            # breaks things wholesale (the generator, say, which the expensive test also
+            # runs and its cheap neighbours do not).
+            others = sorted((selected - big - evidence - passed - failed - never), key=lambda n: (self.ms[n], n))
+            todo += [n for n in others if self.ms[n] < 500][:RISK_SAMPLE]
+            report["to_run"] = len(todo)
+            report["seen_passing"] = len(evidence & passed)
+            if both & failed:
+                by_neighbours = set()           # a neighbour is known to fail: the test stays
+                todo = []
+                report["neighbours"] = "seen failing"
+            # (the executor tests are the ones that count: the optimizer tests only add to them)
+            elif sum(1 for n in evidence & (passed | set(todo)) if name[n].startswith(RISK_EXEC)) < RISK_MIN_EVIDENCE:
+                by_neighbours = set()
+                todo = []
+                report["neighbours"] = "too few"
+        if not scaled and not by_neighbours:
+            report["outcome"] = "too little evidence"
+            return workers
+        out = set()
+        if scaled or todo:
+            bits = 0
+            for n in todo:
+                bits |= 1 << index_of[n]
+            est = self.estimate(bits) + 0.4 * len(scaled)
+            report["est"] = round(est, 2)
+            if est > RISK_PROBE_S or time.monotonic() - self.t0 + est * 2 + 2 > self.wall_budget:
+                report["outcome"] = "over budget"
+                return workers
+            res, cpu = self.probe_run(plan, k, bits, [name[n] for n in scaled])
+            info["verify_cpu"] = round((info.get("verify_cpu") or 0.0) + cpu, 3)
+            report["cpu"] = round(cpu, 2)
+            if (res is None or res.get("unverified") or res.get("deferred") or res.get("pool_breaks")
+                    or res.get("bad_files") or res.get("import_failed") or "unswappable" in res):
+                report["outcome"] = "kept"
+                return workers
+            bad = set(res.get("failed") or ())
+            skipped = set(res.get("not_run") or ())
+            took = res.get("scaled_s") or {}
+            report["scaled_s"] = took
+            for n in scaled:
+                # A stand-in that passes but takes much longer than it does on the pinned
+                # commit says the real test may not finish in the time it is given.
+                if name[n] not in bad and name[n] not in skipped and 0 <= took.get(name[n], -1.0) <= RISK_SCALE_S:
+                    out.add(n)
+            if by_neighbours and not (bad - {name[n] for n in scaled}) and not skipped:
+                out |= by_neighbours
+        else:
+            out |= by_neighbours                # every neighbour was seen passing already
+        if not out:
+            report["outcome"] = "kept"
+            return workers
+        report["outcome"] = "left out"
+        report["tests"] = sorted(name[n].rsplit("::", 1)[1] for n in out)
+        left = {n: self.ms[n] for n in selected - out}
+        return best_split(left)[1] if left else []
+
+    def class_bits(self, cls: str) -> int:
+        """The tests of a class, as a bitset over the map's tests."""
+        if self._class_bits is None:
+            self._class_bits = {}
+            for i, c in enumerate(self._cls):
+                self._class_bits[c] = self._class_bits.get(c, 0) | (1 << i)
+        return self._class_bits.get(cls, 0)
+
+    def probe_run(self, plan, k: int, bits: int, scaled=()):
+        """Run the scaled-down stand-ins, then re-run the given tests whole, against the patched
+        tree. (result of verify.run_tests or None, CPU seconds it took)"""
+        dm = self.dm
+        groups = self.groups(bits, {}, plan.tokens, plan.changed) if bits else []
+        if scaled:
+            # first, and on their own: what they show does not depend on the other tests
+            groups.insert(0, {"ids": list(scaled), "filter": {}, "skip_setup": [], "if_failed": False})
+        # When a class's fixtures cannot be built, every test of the class fails, the expensive
+        # one included. What setUpClass runs is in the coverage of every test of its class, so
+        # the fixtures can only be affected when all of them are candidates: then they are
+        # built here even though the cheap tests do not use them.
+        candidates = plan.full | plan.sliced
+        for g in groups:
+            g["skip_setup"] = [c for c in g.get("skip_setup", ()) if self.class_bits(c) & ~candidates]
+        ids = [t for g in groups for t in g["ids"]]
+        overlay = os.path.join(TMP, f"br_ev_{os.getpid()}_{k}")
+        if self.needs_heavy(ids):
+            self.load_heavy()
+        self.warm_up()
+        use_warm = bool(self._warm) and plan.warm_ok
+        use_hot = (bool(self._warm) and not use_warm and bool(HOT) and plan.hot_ok and bool(plan.swaps)
+                   and verify.can_swap())
+        if use_warm or use_hot:
+            verify.warm_tests(ids)
+        est = self.estimate(bits)
+        verify.remove_overlay(overlay)
+        c0 = os.times()
+        try:
+            verify.build_overlay(SRC, overlay, plan.changed)
+            timeout = min(max(12.0, 6 * est + 8), max(5.0, self.wall_budget - (time.monotonic() - self.t0)))
+            scale = {t: RISK_SCALED[t] for t in scaled}
+            res = verify.run_tests(overlay, HARNESS, groups, timeout=timeout, stop_after=-1,
+                                   warm_root=SRC if (use_warm or use_hot) else None,
+                                   parent_root=SRC if self._warm else None,
+                                   swaps=list(plan.swaps.values()) if use_hot else None, scale=scale)
+            if use_hot and res is not None and "unswappable" in res:
+                res = verify.run_tests(overlay, HARNESS, groups, timeout=timeout, stop_after=-1, parent_root=SRC,
+                                       scale=scale)
+        finally:
+            verify.remove_overlay(overlay)
+        c1 = os.times()
+        return res, (c1.children_user - c0.children_user) + (c1.children_system - c0.children_system)
+
     def handle(self, path: Path, k: int) -> tuple[list[list[int]], dict]:
+        self._plan = None
+        workers, info = self.handle_safely(path, k)
+        if RISK and self._plan is not None:
+            try:
+                workers = self.evidence_probe(self._plan, workers, info, k)
+            except Exception as e:  # noqa: BLE001 - the safe selection stands
+                info["risk"] = f"error {type(e).__name__}: {e}"
+        info.pop("_failed", None)
+        info.pop("_passed", None)
+        return workers, info
+
+    def handle_safely(self, path: Path, k: int) -> tuple[list[list[int]], dict]:
         info: dict = {"commit": path.stem}
         planned = self._plans.pop(path, None)
         if planned is None:
@@ -951,6 +1173,7 @@ class Selector:
         if plan.select_all:
             info["decision"] = "all"
             return self.all_tests(), info
+        self._plan = plan
         dm = self.dm
         overlay = os.path.join(TMP, f"br_ov_{os.getpid()}_{k}")
 

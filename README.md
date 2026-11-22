@@ -79,6 +79,31 @@ CPU time. This entry does both, in that order:
 8. **Split** the selected tests over workers to minimise `largest load + 2 s x workers`
    (`selector/split.py`).
 
+**Two bets on the two most expensive tests** (`Selector.evidence_probe` in
+`selector/main.py`). Up to here a test is selected unless it was shown to pass. For two tests
+that rule is expensive: `TestParser::test_max_nodes` (29 s recorded) and
+`TestExecutor::test_execute_tpcds` (21 s) cost more CPU to re-run than they cost to select, so
+whenever a change can reach them and they were not seen to fail they are selected, mostly for
+nothing. This entry gathers cheaper evidence against the patched tree instead, and leaves the
+test out when the evidence passes. Everything else stays selected.
+
+* **The parser test** builds one statement of a million nodes and expects the parser to
+  refuse it at limits of 1,000,000 and of 50,000 nodes. A stand-in is run in its place: the
+  same test method, recompiled from its source with a statement one hundredth as wide and
+  limits of 4,000 and 5,000 (`RISK_SCALED`; 0.3 s of CPU instead of 30). It has to pass, and
+  in about the time it takes on the pinned commit.
+* **The executor's TPC-DS test**, only when the commit was decided without any re-run and
+  only call-time code changed: the selected cheap tests of its class (under a second each, at
+  least three of them) and the 30 cheapest of the other selected tests are re-run, stopping
+  at the first failure. The test is left out when all of them pass and no executor or
+  optimizer test is known to fail.
+
+Neither bet is made when the patch touches anything but the package's own Python code (the
+evidence says nothing about a test whose own code or data changed), when a patched module
+does not import, or when a re-run hung. Class fixtures are built for the evidence run
+whenever every test of the class is a candidate, because then the change may be in what the
+fixture runs. These are bets, not proofs; "How this was checked" says how they did.
+
 Anything the planner cannot analyse (binary patches, hunks that do not apply, changes to
 test-runner configuration) falls back to selecting every test; a re-run that hangs or
 dies settles nothing, so every candidate of that commit is selected (every test, when it
@@ -201,6 +226,21 @@ at run time, except the three test names in `tools/never_alone.json`.
   fixture-driven optimizer tests (they are often the only test to notice a change), so it
   was removed. What remains is the list of three tests, each of which failed dozens of
   times on trial edits and never as the only failing test.
+
+* **The two bets.** They were first written wider and narrowed by what went wrong. 2,303
+  fresh single-token edits (the sample's operator mix, one random file each) were run through
+  the selector, and for every commit where a bet left a test out that test was then run for
+  real under `pytest`. Asking the executor test's cheap neighbours alone was wrong in 4 of 86
+  such commits, and in 3 more among the labelled commits: after a re-run of the other
+  candidates the expensive test is often one of the few tests left that could notice the
+  change; a change that breaks the generator shows in the dialect tests and not in the
+  executor's cheap ones; and one edit to a module's import-time code made tests fail only
+  after others had run. Hence the restrictions above. In the form described here the same
+  2,303 edits give 58 commits where a test is left out (the executor test in 27, the parser test in 31), and the real run of that test passes in all 58. On the labelled sets (1,482 commits: the 30 of the sample, 1,175 labelled by full `pytest` runs, 53 by `pytest` on the optimizer tests with real pools, 224 by re-running every candidate) no failing test is left out;
+  the bets change the selection of 79 of those commits and take 745 s (5.6%) of selection out of them. Six 60-commit mixes in the sample's proportions, run under the scorer's limits, cost 473 s on average without the bets and 452 s with them (selection plus CPU), with no miss either way. The stand-in of the parser test agreed
+  with the real test on all 37 labelled commits tried one by one, 12 of them commits where
+  the real test fails. The restrictions and thresholds of the bets come from
+  these trial edits; no outcome of any edit is stored or looked up.
 
 ## Build and run
 

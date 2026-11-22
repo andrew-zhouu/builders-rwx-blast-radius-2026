@@ -234,6 +234,40 @@ def _kept_method(case, meth: str, spans):
     return namespace[owner].__dict__[meth]
 
 
+# test id -> [(old text, new text)]: a scaled-down stand-in for an expensive test, made by
+# replacing these pieces of the test method's source (each has to occur exactly once). What
+# such a run shows is evidence about the real test, not its verdict (see main.evidence_probe).
+SCALE_TESTS: dict[str, list] = {}
+
+
+def _scaled_method(case, meth: str, replacements):
+    """The test method recompiled from its source with the given replacements."""
+    import inspect
+    import textwrap
+
+    func = getattr(type(case), meth)
+    if inspect.unwrap(func) is not func or not inspect.isfunction(func):
+        return None
+    code = func.__code__
+    fdef = find_function(code.co_filename, meth, code.co_firstlineno)
+    if fdef is None or fdef.decorator_list:
+        return None
+    lines = _SOURCE_LINES.get(code.co_filename)
+    if lines is None:
+        with open(code.co_filename, encoding="utf-8") as f:
+            lines = _SOURCE_LINES[code.co_filename] = f.read().split("\n")
+    src = "\n".join(lines[fdef.lineno - 1:fdef.end_lineno]) + "\n"
+    for old, new in replacements:
+        if src.count(old) != 1:
+            return None     # the method no longer looks like the one the stand-in was written for
+        src = src.replace(old, new)
+    owner = func.__qualname__.split(".")[-2] if "." in func.__qualname__ else type(case).__name__
+    body = textwrap.indent(textwrap.dedent(src), "    ")
+    namespace: dict = {}
+    exec(compile(f"class {owner}:\n{body}", code.co_filename, "exec"), func.__globals__, namespace)
+    return namespace[owner].__dict__[meth]
+
+
 def find_function(filename: str, name: str, first_line: int):
     """The ast.FunctionDef called `name` that starts at `first_line` of the file."""
     import ast
@@ -254,6 +288,17 @@ def load_case(test_id: str):
     mod_name = file_part[:-3].replace("/", ".")
     module = __import__(mod_name, fromlist=[cls_name])
     case = getattr(module, cls_name)(meth)
+    scale = SCALE_TESTS.get(test_id)
+    if scale:
+        scaled = None
+        try:
+            scaled = _scaled_method(case, meth, scale)
+        except Exception:  # noqa: BLE001
+            scaled = None
+        if scaled is None:
+            raise LightUnavailable(test_id)
+        setattr(case, meth, types.MethodType(scaled, case))
+        return case
     keep = KEEP_STATEMENTS.get(test_id)
     if keep is not None:
         kept = None
