@@ -200,8 +200,9 @@ def import_all(names: list[str]) -> dict[str, str]:
     return failed
 
 
-def static_imports(root: str, names: list[str]) -> dict[str, list[str]]:
-    """{module: modules of the package its top-level code imports}, read from the source."""
+def static_imports(root: str, names: list[str], nested: bool = False) -> dict[str, list[str]]:
+    """{module: modules of the package its top-level code imports}, read from the source.
+    nested: every import statement of the module counts, also the ones inside functions."""
     import ast
     import os
 
@@ -253,7 +254,7 @@ def static_imports(root: str, names: list[str]) -> dict[str, list[str]]:
         except (OSError, SyntaxError):
             continue
         deps: set[str] = set()
-        scan(tree.body, deps, pkg)
+        scan(list(ast.walk(tree)) if nested else tree.body, deps, pkg)
         deps.discard(name)
         out[name] = sorted(deps)
     return out

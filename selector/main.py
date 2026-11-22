@@ -78,6 +78,57 @@ EARLY_STOP = int(_f("BR_EARLY_STOP", 5))     # stop re-running once the first k 
 FIRST_FAIL_MARGIN_MS = _f("BR_FIRST_FAIL_MARGIN_MS", 2500)
 WARM = int(_f("BR_WARM", 1))                 # reuse pinned modules for patches that change no Python code
 HOT = int(_f("BR_HOT", 1))                   # replace function code in place for pure function-body changes
+# TestGenerator::test_generator_memory does the same thing for every dialect; it is re-run on
+# the dialects a patch can reach only (Selector.loop_slice, brh.LOOP_RECIPES).
+PIN = int(_f("BR_PIN", 0))                   # keep the process and its children on one CPU
+USE_LOOPS = int(_f("BR_LOOPS", 1))
+LOOP_TEST = "tests/test_generator.py::TestGenerator::test_generator_memory"
+# The executor's TPC-DS test, when it would be selected without having been seen to fail, is
+# settled in two phases instead (brh.PHASE_RECIPES; Selector.phase_spec): a look at what the
+# parser and the optimizer make of each affected query, and a run of the queries where that
+# differs from the pinned commit.
+USE_PHASES = int(_f("BR_PHASES", 1))
+PHASE_PROBE_S = _f("BR_PHASE_PROBE", 9.0)    # ... when that is expected to cost at most this much CPU
+PHASE_EXEC_S = _f("BR_PHASE_EXEC", 0.0)      # ... plus this much for running queries that differ (0: only looks)
+PHASE_SLICES = int(_f("BR_PHASE_SLICES", 1))  # the same looks when the test is re-run on its affected queries
+PHASE_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+PHASE_AFTER = ("sqlglot/executor/", "sqlglot/planner.py",
+               "sqlglot/serde.py")            # (the digests of the expressions are made with it)
+PHASE_DATA = ("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")   # what the test reads
+PHASE_MORE = int(_f("BR_PHASE_MORE", 1))      # also beside edits of fixture files the test does not read
+# Leaving an expensive test out on the evidence of its neighbours (off by default; see
+# Selector.evidence_probe).
+RISK = int(_f("BR_RISK", 0))
+RISK_EXEC_S = _f("BR_RISK_EXEC_S", 1.0)      # evidence: the executor tests cheaper than this,
+RISK_OPT_S = _f("BR_RISK_OPT_S", 0.0)        # ... and the optimizer tests cheaper than this (0: none)
+RISK_ANY = int(_f("BR_RISK_ANY", 0))         # (for experiments: also for patches outside the package)
+RISK_IMPORT = int(_f("BR_RISK_IMPORT", 1))   # 0: no bet at all on a change to import-time code
+RISK_IMPORT_T = int(_f("BR_RISK_IMPORT_T", 0))  # (for experiments: the neighbour bet on import-time changes too)
+RISK_SAMPLE = int(_f("BR_RISK_SAMPLE", 30))  # this many of the cheapest other selected tests are evidence too
+RISK_VU = int(_f("BR_RISK_VU", 0))           # (for experiments: the neighbour bet after a re-run too)
+RISK_PROBE_S = _f("BR_RISK_PROBE", 12.0)     # getting the evidence may cost at most this much CPU
+RISK_CLASS = int(_f("BR_RISK_CLASS", 0))     # evidence: every candidate of the test's own class (see evidence_probe)
+RISK_MANY = int(_f("BR_RISK_MANY", 8))       # ... and with this many tests known to fail nothing is left out
+RISK_PARSER = "tests/test_parser.py::TestParser::"
+RISK_MIN_EVIDENCE = int(_f("BR_RISK_MIN_EVIDENCE", 3))   # ... and it takes at least this many passing neighbours
+RISK_TESTS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",
+              "tests/test_parser.py::TestParser::test_max_nodes")
+RISK_EXEC = "tests/test_executor.py::TestExecutor::"
+# The expensive parser test builds one statement of a million nodes and expects the parser to
+# refuse it at limits of 1,000,000 and of 50,000 nodes. The stand-in is the same test method
+# with a statement a hundredth as wide (some 12,000 nodes) and limits of 4,000 and 5,000.
+RISK_SCALE = int(_f("BR_RISK_SCALE", 1))
+RISK_SCALE_S = _f("BR_RISK_SCALE_S", 0.8)     # the stand-in takes 0.3 s of CPU on the pinned commit ...
+RISK_SCALE_X = _f("BR_RISK_SCALE_X", 2.5)     # ... and may take this many times what it takes there on this machine
+RISK_SCALED = {
+    "tests/test_parser.py::TestParser::test_max_nodes": [
+        ["        width = 10000" + chr(10), "        width = 100" + chr(10)],
+        ["            parse_one(sql, max_nodes=1_000_000)" + chr(10), "            parse_one(sql, max_nodes=4_000)" + chr(10)],
+        ["            parse_one(sql, max_nodes=50_000)" + chr(10), "            parse_one(sql, max_nodes=5_000)" + chr(10)],
+        ['self.assertIn("(50000)", str(ctx.exception))', 'self.assertIn("(5000)", str(ctx.exception))'],
+    ],
+}
+RISK_OPT = "tests/test_optimizer.py::TestOptimizer::"
 USE_STATE = int(_f("BR_USE_STATE", 1))       # measure what import-time changes alter (state.py)
 STATE_MIN_S = _f("BR_STATE_MIN", 1.2)        # ... when re-running the static candidates costs more than this
 STATE_IMPORT_LIMIT_S = int(_f("BR_STATE_IMPORT_LIMIT", 30))   # ... and the most that importing and comparing may take
@@ -98,6 +149,8 @@ class Job:
         self.blind_ms = 0
         self.blind: dict[int, int] = {}
         self.unknown_outcome: dict[int, int] = {}   # what to select when the re-run dies or hangs
+        self.loops: dict = {}                       # test id -> members its loop is cut down to (brh.LOOP_SLICE)
+        self.phased: dict = {}                      # test id -> spec for brh.PHASED
         self.whole = 0
         self.slices: dict = {}
         self.lights: dict = {}
@@ -144,6 +197,12 @@ class Selector:
         self._base_scope: set = set()      # ... the modules it covers
         self._plans: dict = {}             # commit path -> (files, plan) or the exception planning raised
         self._meth: list | None = None     # method name of each test of the map
+        self._plan = None                  # the plan of the commit being handled (evidence_probe)
+        self._loop_uses: dict | None = None    # verify.dialect_uses, once
+        self._scaled_base: dict = {}           # stand-in -> CPU seconds on the pinned tree, measured in this run
+        self._loop_failed = False
+        self._phase_costs: list | None = None  # the queries of PHASE_TEST that it reaches
+        self._class_bits: dict | None = None
         # tests known not to use their class-level fixtures (map index)
         self.no_setup = {self.dm.index[t] for t in self.dm.extra.get("no_class_setup", ())
                          if t in self.dm.index}
@@ -419,6 +478,124 @@ class Selector:
             chosen[n] = self.ms[n]
         return best_split(chosen)[1]
 
+    # -- a test that loops over the dialects -------------------------------------------------
+    def loop_ready(self, plan) -> bool:
+        """Could the loop test be cut down for this patch? (Measures, once, what each round of
+        the loop uses on the pinned tree: that has to happen in this process's lineage before
+        a child imports a patched tree.)"""
+        if not USE_LOOPS or self._loop_failed or self.facts is None or "imports_all" not in self.facts:
+            return False
+        i = self.dm.index.get(LOOP_TEST)
+        if i is None or not (plan.candidates >> i) & 1:
+            return False
+        if not plan.changed or any(not (f.startswith("sqlglot/") and f.endswith(".py")) or text is None
+                                   for f, text in plan.changed.items()):
+            return False
+        if not self.same_imports(plan):
+            return False
+        if self._loop_uses is None:
+            c0 = os.times()
+            uses = verify.dialect_uses(SRC)
+            c1 = os.times()
+            self.t_imports += (c1.children_user - c0.children_user) + (c1.children_system - c0.children_system)
+            if not uses:
+                self._loop_failed = True
+                return False
+            self._loop_uses = {k: set(v) for k, v in uses.items()}
+        return True
+
+    def same_imports(self, plan) -> bool:
+        """Does every changed file import what it imports on the pinned commit? (The import
+        graph of the pinned tree is only good for such patches.)"""
+        import ast
+
+        def imports(text: str):
+            return sorted(ast.dump(n) for n in ast.walk(ast.parse(text)) if isinstance(n, (ast.Import, ast.ImportFrom)))
+
+        try:
+            for rel, text in plan.changed.items():
+                if imports(Path(SRC, rel).read_text(encoding="utf-8")) != imports(text):
+                    return False
+        except (OSError, SyntaxError, ValueError, RecursionError):
+            return False
+        return True
+
+    def loop_slice(self, plan, extra_modules=()):
+        """The members of the dialect enumeration whose round of the loop test the patch can
+        reach, or None when that is all of them (or cannot be told). A round is reached when
+        one of the modules it uses on the pinned tree is a changed module, a module in which
+        importing the patched tree computed something different (extra_modules), or a module
+        that imports one of those, directly or not. Any other round runs the same code on the
+        same objects as on the pinned commit."""
+        if self._loop_uses is None:
+            return None
+        from . import state as st
+
+        mods = set(extra_modules)
+        for rel in plan.changed:
+            m = rel[:-3].replace("/", ".")
+            mods.add(m[:-9] if m.endswith(".__init__") else m)
+        reach = st.dependents(self.facts["imports_all"], mods)
+        hit = sorted(d for d, used in self._loop_uses.items() if used & reach)
+        if not hit or len(hit) >= len(self._loop_uses):
+            return None
+        return hit
+
+    def with_loop_slice(self, plan, extra_modules=()):
+        """(members to keep or None, the CPU of the loop test as the map has it): while the
+        commit is decided and re-run, the test counts for what the kept rounds cost."""
+        i = self.dm.index.get(LOOP_TEST)
+        hit = self.loop_slice(plan, extra_modules)
+        if i is None or hit is None:
+            return None, None
+        before = self.dm.cpu[i]
+        self.dm.cpu[i] = before * len(hit) / len(self._loop_uses) + 0.02
+        return hit, before
+
+    def phase_spec(self, tid: str, plan, costs: list):
+        """(expected CPU of the looks, CPU of the queries that have to be run in any case, spec
+        for brh.PHASED) for settling this test in two phases on the given affected fixture
+        entries [(cpu, file, entry)], or None when that is not possible. The entries whose
+        lines outside parsing and optimizing the patch leaves alone only need a look at their
+        parsed and optimized expressions; the others have to be executed."""
+        if not USE_PHASES or not plan.phase_ok or not plan.regions or not costs:
+            return None
+        if plan.phase_fixtures and not PHASE_MORE:
+            return None
+        if plan.phase_fixtures:
+            i = self.dm.index.get(tid)
+            mine = self.fixture_files.get(i, ()) if i is not None else ()
+            for rel in plan.phase_fixtures:
+                if (i is None or rel.startswith(PHASE_DATA) or (self.dm.openers(rel) >> i) & 1
+                        or any(rel.endswith(name) for name in mine)):
+                    return None     # the test reads the edited file
+        if any(rel.startswith(PHASE_AFTER) for rel in plan.changed):
+            return None     # the executor and the planner are what runs after the optimizer
+        ph = self.dm.phases().get(tid)
+        if ph is None:
+            return None
+        mask = 0
+        for rel, lo, hi in plan.regions:
+            for line, bit in ph["by_file"].get(rel, ()):
+                if lo <= line <= hi:
+                    mask |= 1 << bit
+        eligible = []
+        look = owed = 0.0
+        for c, f, k in costs:
+            if f != ph["file"]:
+                return None
+            other = ph["other"].get(str(k))
+            if other is None or ph["fp"].get(str(k)) is None or other & mask:
+                owed += c
+            else:
+                eligible.append(k)
+                look += ph["opt_cpu"].get(str(k), 0.1)
+        if not eligible:
+            return None
+        return look, owed, {"fp": {str(k): ph["fp"][str(k)] for k in eligible}, "eligible": eligible,
+                            "cost": {str(k): round(c, 3) for c, _, k in costs}, "max_exec": PHASE_EXEC_S,
+                            "look_cost": {str(k): ph["opt_cpu"].get(str(k), 0.1) for k in eligible}}
+
     def after_pool_break(self, risky: int, broke: int = 0) -> int:
         """Tests that fail when one of `risky` breaks a process pool.
 
@@ -591,6 +768,8 @@ class Selector:
                 continue
             costs.sort()
             total = sum(c for c, _, _ in costs)
+            if tid == PHASE_TEST:
+                self._phase_costs = list(costs)
             # Settling the test by re-running every affected entry must be cheaper than
             # simply selecting it.
             n = self.num[i]
@@ -810,6 +989,23 @@ class Selector:
             job.final = best_split(blind)[1]
             return job
         job.whole, job.slices, job.lights, job.light_bits, job.hard = whole, slices, lights, light_bits, hard
+        if PHASE_SLICES and USE_PHASES and self._phase_costs:
+            # The executor's TPC-DS test, re-run on every query the patch reaches: a query
+            # whose parsed and optimized expressions are those of the pinned commit, and
+            # that runs no changed line afterwards, is not executed (brh.PHASED). The
+            # others are, one at a time; nothing is given up, so the test is settled as
+            # it would be by executing them all.
+            it = dm.index.get(PHASE_TEST)
+            sl = slices.get(it) if it is not None else None
+            if sl is not None and sl[2] and "@unit" not in sl[0]:
+                kept = {(f, q) for f, ks in sl[0].items() for q in ks}
+                mine = [c for c in self._phase_costs if (c[1], c[2]) in kept]
+                spec = self.phase_spec(PHASE_TEST, plan, mine) if len(mine) == len(kept) else None
+                if spec is not None:
+                    what = spec[2]
+                    what.update(max_exec=1e9, max_differ=10 ** 9, bail=False)
+                    job.phased = {PHASE_TEST: what}
+                    info["phase_slice"] = [len(what["eligible"]), len(mine)]
         job.hard_dominates, job.est = hard_dominates, est
         # ... and what it may cost at most, with the slices that only run after a failure
         later = [i for i, sl in slices.items() if sl[3]]
@@ -852,6 +1048,8 @@ class Selector:
             if i is not None:
                 failed_bits |= 1 << i
         info["n_fail"] = failed_bits.bit_count()
+        if res.get("phase"):
+            info["phase_run"] = res["phase"].get(PHASE_TEST)    # [queries looked at, different, executed]
         if "times" in res:
             info["times"] = res["times"]
         info["fail_reasons"] = {t: r[:100] for t, r in list(res["failed"].items())[:3]}
@@ -928,6 +1126,11 @@ class Selector:
         if extra or breakers:
             selected |= extra
             info["pool"] = [breakers.bit_count(), extra.bit_count()]
+        if RISK or USE_PHASES:
+            settled = ran & ~failed_bits & ~unsettled & ~stopped
+            # (seen failing: not the ones only assumed to fail after an early stop)
+            info["_failed"] = [self.num[i] for i in dm.ids(failed_bits & ~stopped) if self.num[i] is not None]
+            info["_passed"] = [self.num[i] for i in dm.ids(settled) if self.num[i] is not None]
         out = self.durations(selected)
         if out:
             for n in self.unknown:
@@ -935,7 +1138,344 @@ class Selector:
         info["decision"] = decision
         return best_split(out)[1]
 
+    # -- leaving an expensive test out on evidence (BR_RISK) ----------------------------------
+    def evidence_probe(self, plan, workers, info: dict, k: int):
+        """Two tests cost 21 s and 29 s to select and more than that to re-run. When one of them
+        is in the selection without having been seen to fail, something cheaper is tried:
+
+        * the executor's TPC-DS test is settled in two phases when the patch allows it
+          (phase_spec): this is exact, not a bet;
+        * (BR_RISK) the parser test (a statement of a million nodes has to be refused) is run
+          in a scaled-down form, RISK_SCALED, and has to pass in about the time that takes
+          on the pinned commit;
+        * (BR_RISK) for the executor's test, where two phases are not possible, only when the
+          commit was decided without a re-run and only call-time code changed: the selected
+          cheap tests of its class and the cheapest of the other selected tests are re-run,
+          unless an executor or optimizer test is already known to fail.
+
+        A test that is settled as passing, or whose evidence passes, is taken out of the
+        selection; everything else stays. The last two are bets, not proofs: see the README."""
+        selected = {n for w in workers for n in w}
+        if not selected:
+            return workers
+        decision = str(info.get("decision"))
+        if decision.startswith("all") or "hang" in decision or info.get("import_failed") or info.get("bad_files"):
+            return workers
+        # Only for changes to the package's own code: the evidence says nothing about a test
+        # whose own code or data (tests/, fixtures, other files) was changed.
+        risk = RISK
+        if not RISK_ANY and (not plan.changed or any(not (f.startswith("sqlglot/") and f.endswith(".py")) or text is None
+                                                     for f, text in plan.changed.items())):
+            # ... except that the two-phase check, which is exact, holds beside edits of
+            # fixture files that the executor's test does not read (phase_spec looks at that).
+            others = [f for f, text in plan.changed.items()
+                      if not (f.startswith("sqlglot/") and f.endswith(".py") and text is not None)]
+            if not (PHASE_MORE and USE_PHASES and others and len(others) < len(plan.changed)
+                    and all(f in plan.phase_fixtures for f in others)):
+                return workers
+            risk = 0
+        dm = self.dm
+        failed = set(info.get("_failed") or ())
+        passed = set(info.get("_passed") or ())
+        index_of = {n: i for i, n in enumerate(self.num) if n is not None}
+        name = {n: dm.tests[i] for n, i in index_of.items()}
+        big = {self.num[dm.index[t]] for t in RISK_TESTS if t in dm.index}
+        unsure = (big & selected) - failed
+        if not unsure:
+            return workers
+        report: dict = {"unsure": len(unsure)}
+        info["risk"] = report
+        both = {n for n in index_of if name[n].startswith((RISK_EXEC, RISK_OPT))}
+        # -- two phases for the executor test: exact
+        phased: dict = {}
+        phase_group = None
+        phase_est = phase_wall = 0.0
+        phase_all = False
+        phase_n = next((n for n in unsure if name[n] == PHASE_TEST), None)
+        if phase_n is not None and USE_PHASES and not self._phase_costs:
+            # Which queries the patch reaches was not worked out for this commit: all of them, then.
+            ph = dm.phases().get(PHASE_TEST)
+            if ph is not None:
+                self._phase_costs = [(0.65, ph["file"], int(q)) for q in sorted(ph["fp"], key=int)]
+                phase_all = True
+        if phase_n is not None and USE_PHASES:
+            # (why two phases were not tried, for the report)
+            report["phase_why"] = ("no affected queries known" if not self._phase_costs
+                                   else "an executor test fails" if failed & {n for n in both if name[n].startswith(RISK_EXEC)}
+                                   else "not only call-time code" if not plan.phase_ok or not plan.regions
+                                   else "fixture files edited" if plan.phase_fixtures
+                                   else "queries run changed code after the optimizer")
+        if phase_n is not None and self._phase_costs and not (failed & {n for n in both if name[n].startswith(RISK_EXEC)}):
+            spec = self.phase_spec(PHASE_TEST, plan, self._phase_costs)
+            if spec is not None:
+                report.pop("phase_why", None)
+                look, owed, what = spec
+                cls_key = self._cls[index_of[phase_n]]
+                setup = dm.class_setup.get(cls_key, 0.0) if owed else 0.0
+                report["phase_est"] = [round(look, 2), round(owed, 2), len(what["eligible"]), len(self._phase_costs)]
+                saves = (best_split({n: self.ms[n] for n in selected})[0]
+                         - best_split({n: self.ms[n] for n in selected if n != phase_n})[0]) / 1000.0
+                report["phase_saves"] = round(saves, 1)
+                if PHASE_MORE and saves < 1.5 * (look + owed + setup) + 1.0:
+                    report["phase_why"] = "saves too little"
+                elif owed <= PHASE_EXEC_S and look + owed + setup <= PHASE_PROBE_S:
+                    flt: dict = {}
+                    for _, f, q in (() if phase_all else self._phase_costs):
+                        flt.setdefault(f, set()).add(q)
+                    # A ceiling; the looks watch their own pace. Both leave room for a machine
+                    # several times slower than the one the map's seconds were measured on.
+                    what["max_cpu"] = round(10.0 * look + 4.0, 2)
+                    if not PHASE_EXEC_S:
+                        # Looks only: the first query that differs leaves the test unsettled, no
+                        # fixture is built and nothing is executed, so what a try costs is
+                        # bounded by the looks whatever the machine.
+                        what["max_differ"] = 0
+                    phased[PHASE_TEST] = what
+                    phase_group = {"ids": [PHASE_TEST], "filter": {f: sorted(ks) for f, ks in flt.items()},
+                                   "skip_setup": [cls_key], "if_failed": False, "own_setup": True}
+                    phase_est = look + owed + setup
+                    phase_wall = what["max_cpu"] + PHASE_EXEC_S * 2 + 4.0
+        if not risk and phase_group is None:
+            report["outcome"] = "not tried"
+            return workers
+        # -- which evidence to gather for the bets
+        scaled = sorted(n for n in unsure if risk and RISK_SCALE and name[n] in RISK_SCALED)
+        if RISK_IMPORT or (plan.all_call_time and not info.get("state")):
+            pass
+        else:
+            scaled = []
+        by_neighbours = (unsure - set(scaled)) if risk else set()
+        if phase_group is not None:
+            by_neighbours.discard(phase_n)      # settled exactly instead
+        todo: list = []
+        todo_m: list = []
+        if RISK_CLASS and (scaled or by_neighbours) and len(failed) >= RISK_MANY:
+            # A commit that breaks this much can break any test.
+            scaled, by_neighbours = [], set()
+            report["neighbours"] = "many failures"
+        if RISK_CLASS and scaled:
+            # The parser's test: every candidate of its class has to pass as well.
+            mates = {n for n in index_of if name[n].startswith(RISK_PARSER)} - big
+            if mates & failed:
+                scaled = []
+                report["stand_in"] = "a parser test fails"
+            else:
+                todo_m = sorted((mates & selected) - passed)
+        if by_neighbours and not (RISK_VU or RISK_CLASS) and decision.split("(")[0] != "blind":
+            # After a re-run of the other candidates the expensive test is one of the few
+            # tests left that could notice the change: there the neighbours were wrong too often.
+            by_neighbours = set()
+            report["neighbours"] = "not asked"
+        if by_neighbours and (not plan.all_call_time or info.get("state")):
+            # A change to what importing a module does: when it could not be worked out which
+            # tests use the changed definitions, tests can depend on what ran before them in
+            # the suite, and a run of a few tests on their own does not show that.
+            notes = info.get("notes") or ()
+            if not RISK_IMPORT_T or any("module users" in n or "uses unknown" in n for n in notes):
+                by_neighbours = set()
+                report["neighbours"] = "not asked (import time)"
+        if by_neighbours:
+            never = {self.num[i] for i in dm.ids(self.never_alone)}
+            evidence = set()
+            for n in both - never:
+                limit = RISK_EXEC_S if name[n].startswith(RISK_EXEC) else RISK_OPT_S
+                if self.ms[n] < limit * 1000:
+                    evidence.add(n)
+            if RISK_CLASS:
+                # every test of the executor's and the optimizer's class, whatever it costs:
+                # the ones still selected without a verdict are run now
+                evidence = both - big
+            todo = sorted((evidence & selected) - passed)
+            # ... and the cheapest of the other selected tests: when they fail, the change
+            # breaks things wholesale (the generator, say, which the expensive test also
+            # runs and its cheap neighbours do not).
+            others = sorted((selected - big - evidence - passed - failed - never), key=lambda n: (self.ms[n], n))
+            todo += [n for n in others if self.ms[n] < 500][:RISK_SAMPLE]
+            report["to_run"] = len(todo)
+            report["seen_passing"] = len(evidence & passed)
+            if both & failed:
+                by_neighbours = set()           # a neighbour is known to fail: the test stays
+                todo = []
+                report["neighbours"] = "seen failing"
+            # (the executor tests are the ones that count: the optimizer tests only add to them)
+            elif sum(1 for n in evidence & (passed | set(todo)) if name[n].startswith(RISK_EXEC)) < RISK_MIN_EVIDENCE:
+                by_neighbours = set()
+                todo = []
+                report["neighbours"] = "too few"
+        if not scaled and not by_neighbours and phase_group is None:
+            report["outcome"] = "too little evidence"
+            return workers
+        out = set()
+        if scaled or todo or phase_group is not None:
+            bits_m = 0
+            for n in todo_m:
+                bits_m |= 1 << index_of[n]
+            est_m = self.estimate(bits_m) if bits_m else 0.0
+            if est_m > RISK_PROBE_S / 2:
+                scaled, todo_m, bits_m, est_m = [], [], 0, 0.0      # too much to pay for
+                report["stand_in"] = "over budget"
+            bits = 0
+            for n in todo:
+                bits |= 1 << index_of[n]
+            est = (self.estimate(bits | bits_m) if (bits | bits_m) else 0.0) + 0.4 * len(scaled)
+            if est > RISK_PROBE_S:
+                # too much evidence to pay for: the neighbour bet is dropped, the rest stays
+                by_neighbours, todo, bits = set(), [], 0
+                est = est_m + 0.4 * len(scaled)
+                report["neighbours"] = "over budget"
+            bits |= bits_m
+            if RISK_CLASS and (scaled or by_neighbours):
+                # ... and not when it costs more than leaving the tests out saves
+                gone = set(scaled) | by_neighbours
+                saves = (best_split({n: self.ms[n] for n in selected})[0]
+                         - best_split({n: self.ms[n] for n in selected if n not in gone})[0]) / 1000.0
+                report["saves"] = round(saves, 1)
+                if saves < 1.2 * est + 0.5:
+                    scaled, todo_m, by_neighbours, todo, bits, est = [], [], set(), [], 0, 0.0
+                    report["neighbours"] = "saves too little"
+            est += phase_est
+            report["est"] = round(est, 2)
+            if time.monotonic() - self.t0 + est * 2 + 2 > self.wall_budget or not (scaled or bits or phase_group):
+                report["outcome"] = "over budget"
+                return workers
+            res, cpu = self.probe_run(plan, k, bits, [name[n] for n in scaled], phase_group, phased,
+                                      extra_s=0.4 * len(scaled), extra_wall=phase_wall)
+            info["verify_cpu"] = round((info.get("verify_cpu") or 0.0) + cpu, 3)
+            report["cpu"] = round(cpu, 2)
+            if (res is None or res.get("deferred") or res.get("pool_breaks")
+                    or res.get("bad_files") or res.get("import_failed") or "unswappable" in res):
+                report["outcome"] = "kept"
+                return workers
+            bad = set(res.get("failed") or ())
+            skipped = set(res.get("not_run") or ()) | set(res.get("unverified") or ())
+            took = res.get("scaled_s") or {}
+            if took:
+                report["scaled_s"] = took
+            if res.get("phase"):
+                report["phase"] = res["phase"].get(PHASE_TEST)
+            mates_ok = not any(name[x] in bad or name[x] in skipped for x in todo_m)
+            for n in scaled:
+                # A stand-in that passes but takes much longer than it does on the pinned
+                # commit says the real test may not finish in the time it is given.
+                if (mates_ok and name[n] not in bad and name[n] not in skipped
+                        and 0 <= took.get(name[n], -1.0) <= self.scaled_limit(name[n], k)):
+                    out.add(n)
+            if phase_group is not None and PHASE_TEST not in bad and PHASE_TEST not in skipped:
+                out.add(phase_n)                # every affected query does what it does on the pinned commit
+                report["settled"] = "two phases"
+            special = {name[n] for n in scaled} | {PHASE_TEST}
+            if by_neighbours and not (bad - special) and not (skipped - special):
+                out |= by_neighbours
+        else:
+            out |= by_neighbours                # every neighbour was seen passing already
+        if not out:
+            report["outcome"] = "kept"
+            return workers
+        report["outcome"] = "left out"
+        report["tests"] = sorted(name[n].rsplit("::", 1)[1] for n in out)
+        left = {n: self.ms[n] for n in selected - out}
+        return best_split(left)[1] if left else []
+
+    def scaled_limit(self, tid: str, k: int) -> float:
+        """How long the stand-in of a test may take: a few times what it takes on the pinned
+        tree on this machine (measured once, in a child that runs it on the pinned modules);
+        the fixed limit when that cannot be measured."""
+        base = self._scaled_base.get(tid)
+        if base is None:
+            base = -1.0
+            overlay = os.path.join(TMP, f"br_sb_{os.getpid()}_{k}")
+            try:
+                self.warm_up()
+                if self._warm:
+                    verify.warm_tests([tid])
+                    verify.remove_overlay(overlay)
+                    verify.build_overlay(SRC, overlay, {})
+                    res = verify.run_tests(overlay, HARNESS, [{"ids": [tid], "filter": {}, "skip_setup": [], "if_failed": False}],
+                                           timeout=20.0, warm_root=SRC, scale={tid: RISK_SCALED[tid]})
+                    if res is not None and not res.get("failed") and not res.get("unverified"):
+                        base = float((res.get("scaled_s") or {}).get(tid, -1.0))
+            except Exception:  # noqa: BLE001 - no baseline: the fixed limit
+                base = -1.0
+            finally:
+                verify.remove_overlay(overlay)
+            self._scaled_base[tid] = base
+        if base <= 0:
+            return RISK_SCALE_S
+        return max(RISK_SCALE_X * base, base + 0.3)
+
+    def class_bits(self, cls: str) -> int:
+        """The tests of a class, as a bitset over the map's tests."""
+        if self._class_bits is None:
+            self._class_bits = {}
+            for i, c in enumerate(self._cls):
+                self._class_bits[c] = self._class_bits.get(c, 0) | (1 << i)
+        return self._class_bits.get(cls, 0)
+
+    def probe_run(self, plan, k: int, bits: int, scaled=(), phase_group=None, phased=None, extra_s: float = 0.0,
+                  extra_wall: float = 0.0):
+        """Run the scaled-down stand-ins, the two-phase test, then re-run the given tests
+        whole, against the patched tree. Each of the three is run whatever the others show.
+        (result of verify.run_tests or None, CPU seconds it took)"""
+        dm = self.dm
+        groups = self.groups(bits, {}, plan.tokens, plan.changed) if bits else []
+        if phase_group is not None:
+            groups.insert(0, phase_group)
+        if scaled:
+            # first, and on their own: what they show does not depend on the other tests
+            groups.insert(0, {"ids": list(scaled), "filter": {}, "skip_setup": [], "if_failed": False})
+        # When a class's fixtures cannot be built, every test of the class fails, the expensive
+        # one included. What setUpClass runs is in the coverage of every test of its class, so
+        # the fixtures can only be affected when all of them are candidates: then they are
+        # built here even though the cheap tests do not use them.
+        candidates = plan.full | plan.sliced
+        for g in groups:
+            if not g.get("own_setup"):      # (the two-phase runner builds its fixture when it needs it)
+                g["skip_setup"] = [c for c in g.get("skip_setup", ()) if self.class_bits(c) & ~candidates]
+        ids = [t for g in groups for t in g["ids"]]
+        overlay = os.path.join(TMP, f"br_ev_{os.getpid()}_{k}")
+        if self.needs_heavy(ids):
+            self.load_heavy()
+        self.warm_up()
+        use_warm = bool(self._warm) and plan.warm_ok
+        use_hot = (bool(self._warm) and not use_warm and bool(HOT) and plan.hot_ok and bool(plan.swaps)
+                   and verify.can_swap())
+        if use_warm or use_hot:
+            verify.warm_tests(ids)
+        est = (self.estimate(bits) if bits else 0.0) + extra_s
+        verify.remove_overlay(overlay)
+        c0 = os.times()
+        try:
+            verify.build_overlay(SRC, overlay, plan.changed)
+            base = max(12.0, 6 * est + 8) if (bits or scaled or not extra_wall) else 0.0
+            timeout = min(base + extra_wall, max(5.0, self.wall_budget - (time.monotonic() - self.t0)))
+            scale = {t: RISK_SCALED[t] for t in scaled}
+            res = verify.run_tests(overlay, HARNESS, groups, timeout=timeout, stop_after=0,
+                                   warm_root=SRC if (use_warm or use_hot) else None,
+                                   parent_root=SRC if self._warm else None,
+                                   swaps=list(plan.swaps.values()) if use_hot else None, scale=scale,
+                                   phased=phased)
+            if use_hot and res is not None and "unswappable" in res:
+                res = verify.run_tests(overlay, HARNESS, groups, timeout=timeout, stop_after=0, parent_root=SRC,
+                                       scale=scale, phased=phased)
+        finally:
+            verify.remove_overlay(overlay)
+        c1 = os.times()
+        return res, (c1.children_user - c0.children_user) + (c1.children_system - c0.children_system)
+
     def handle(self, path: Path, k: int) -> tuple[list[list[int]], dict]:
+        self._plan = None
+        self._phase_costs = None
+        workers, info = self.handle_safely(path, k)
+        if (RISK or USE_PHASES) and self._plan is not None:
+            try:
+                workers = self.evidence_probe(self._plan, workers, info, k)
+            except Exception as e:  # noqa: BLE001 - the safe selection stands
+                info["risk"] = f"error {type(e).__name__}: {e}"
+        info.pop("_failed", None)
+        info.pop("_passed", None)
+        return workers, info
+
+    def handle_safely(self, path: Path, k: int) -> tuple[list[list[int]], dict]:
         info: dict = {"commit": path.stem}
         planned = self._plans.pop(path, None)
         if planned is None:
@@ -951,6 +1491,7 @@ class Selector:
         if plan.select_all:
             info["decision"] = "all"
             return self.all_tests(), info
+        self._plan = plan
         dm = self.dm
         overlay = os.path.join(TMP, f"br_ov_{os.getpid()}_{k}")
 
@@ -967,7 +1508,15 @@ class Selector:
             pl.settle_imports(None)
 
         settle(plan, dm)
-        job = self.decide(plan, files, info, settle)
+        loops, loop_cpu = self.with_loop_slice(plan) if self.loop_ready(plan) else (None, None)
+        try:
+            job = self.decide(plan, files, info, settle)
+        finally:
+            if loop_cpu is not None:
+                dm.cpu[dm.index[LOOP_TEST]] = loop_cpu
+        job.loops = {LOOP_TEST: loops} if loops is not None else {}
+        if loops is not None:
+            info["loop"] = len(loops)
         # Import-time code changed: the patched modules may not import any more.
         check = self.import_names(plan) if plan.import_check else []
         if job.final is not None:
@@ -999,13 +1548,14 @@ class Selector:
                                    stop_after=job.stop, warm_root=SRC if (use_warm or use_hot) else None,
                                    parent_root=SRC if self._warm else None,
                                    swaps=list(plan.swaps.values()) if use_hot else None, keep=job.keep,
-                                   check=check)
+                                   check=check, loops=job.loops, phased=job.phased)
             if use_hot and res is not None and "unswappable" in res:
                 # Not replaceable in place after all: import the patched tree afresh.
                 info["unswappable"] = res["unswappable"]
                 info["warm"] = False
                 res = verify.run_tests(overlay, HARNESS, job.groups, timeout=timeout, drops=job.drops,
-                                       stop_after=job.stop, parent_root=SRC, keep=job.keep, check=check)
+                                       stop_after=job.stop, parent_root=SRC, keep=job.keep, check=check,
+                                       loops=job.loops, phased=job.phased)
         finally:
             verify.remove_overlay(overlay)
         c1 = os.times()
@@ -1034,6 +1584,7 @@ class Selector:
         self.t_imports += time.process_time() - p0
         modules = set(plan.import_modules)
         info["state"] = True
+        loop_ok = self.loop_ready(plan)
         if self.probes is not None:
             self.probes.dm.idents()   # load before forking: the child may need it
 
@@ -1076,7 +1627,15 @@ class Selector:
 
             settle(plan, dm)
             info["notes"] = plan.notes + notes
+            loops = None
+            if loop_ok and not failed and not added and not removed:
+                # (the modules in which the import computed something else count as changed)
+                loops, _ = self.with_loop_slice(plan, {p.split("|", 1)[0] for p in paths})
+            elif REPORT and USE_LOOPS:
+                info["loop_why"] = [bool(loop_ok), len(failed), len(added), len(removed), self._loop_failed]
             job = self.decide(plan, files, info, settle)
+            if loops is not None:
+                info["loop"] = len(loops)
             if job.final is not None:
                 signal.alarm(0)
                 return {"workers": job.final, "info": info}
@@ -1087,7 +1646,8 @@ class Selector:
                 signal.alarm(int(max(12.0, 6 * job.est_max + 8)) + 1)
             except OSError:
                 signal.alarm(0)     # no word left: the parent's limit applies, and it selects everything
-            res = verify.run_groups(job.groups, job.drops, job.stop, job.keep)
+            res = verify.run_groups(job.groups, job.drops, job.stop, job.keep,
+                                    loops={LOOP_TEST: loops} if loops is not None else None, phased=job.phased)
             signal.alarm(0)
             return {"workers": self.conclude(job, res, plan, info), "info": info}
 
@@ -1140,6 +1700,7 @@ class Selector:
             out.flush()
             info["wall"] = round(time.monotonic() - w0, 3)
             info["selected"] = sum(len(w) for w in workers)
+            release_pin_if_slow(self.t0)
             log(json.dumps(info))
             if self.report:
                 self.report.write(json.dumps(info) + "\n")
@@ -1153,7 +1714,43 @@ class Selector:
             self.report.close()
 
 
+_ALL_CPUS: set | None = None       # the CPUs this process may use, while it keeps to one of them
+
+
+def pin_to_one_cpu():
+    """Everything here runs one process after the other, so a second CPU buys nothing; staying
+    on one spares migrations and the helper threads that libraries start per CPU."""
+    global _ALL_CPUS
+    try:
+        cpus = os.sched_getaffinity(0)
+        if len(cpus) > 1:
+            os.sched_setaffinity(0, {max(cpus)})
+            _ALL_CPUS = set(cpus)
+    except Exception:  # noqa: BLE001 - not available: run as before
+        _ALL_CPUS = None
+
+
+def release_pin_if_slow(t0: float):
+    """Give the other CPUs back when the clock runs well ahead of the CPU time: the one CPU
+    is then shared with something else, and waiting for it could cost the time limit."""
+    global _ALL_CPUS
+    if _ALL_CPUS is None:
+        return
+    t = os.times()
+    cpu = t.user + t.system + t.children_user + t.children_system
+    wall = time.monotonic() - t0
+    if wall > 1.5 * cpu + 3.0:
+        try:
+            os.sched_setaffinity(0, _ALL_CPUS)
+        except Exception:  # noqa: BLE001
+            pass
+        _ALL_CPUS = None
+        log(f"one CPU given up: wall {wall:.1f}s, cpu {cpu:.1f}s")
+
+
 def main():
+    if PIN:
+        pin_to_one_cpu()
     Selector().run()
 
 
