@@ -47,6 +47,14 @@ class Plan:
         # the ones that use what the statement defines: whether the patched modules still
         # import is always looked at (main.py).
         self.import_check: set[str] = set()
+        # While phase_ok: the patch changes nothing but the bodies (or signatures) of functions
+        # that no import runs, and `regions` lists them as (file, first line, last line) of
+        # the top-level function around each change, pinned coordinates. Then a piece of a
+        # test that runs none of those lines behaves as on the pinned commit (brh.PHASED).
+        self.regions: list = []
+        self.phase_ok = True
+        # Edited fixture files: the reasoning holds for a test that does not read them.
+        self.phase_fixtures: list = []
         # True when the patch changes code that may run while a process pool pickles or
         # unpickles (DepMap.pickle_time), or something that could not be analysed: then a
         # test that uses a shared pool may break it for the tests after it (main.py).
@@ -127,15 +135,18 @@ def plan_python(dm: DepMap, plan: Plan, rel: str, old: str | None, new: str | No
     readers = dm.openers(rel)
     if not rel.startswith("sqlglot/"):
         plan.pool_risk = True       # test code: not looked at any closer
+        plan.phase_ok = False
     if readers:
         plan.warm_ok = plan.hot_ok = False
         plan.all_call_time = False
         plan.pool_risk = True
+        plan.phase_ok = False
         plan.add(readers)
         plan.note(f"{rel}: read as a file by {readers.bit_count()} tests")
     if old is None:
         plan.warm_ok = plan.hot_ok = False
         plan.pool_risk = True
+        plan.phase_ok = False
         # A new module: nothing imports it at the pinned commit, but code that
         # enumerates its package directory may now see it.
         listers = dm.extra_set("dir_listers", os.path.dirname(rel))
@@ -146,6 +157,7 @@ def plan_python(dm: DepMap, plan: Plan, rel: str, old: str | None, new: str | No
         plan.warm_ok = plan.hot_ok = False
         plan.all_call_time = False
         plan.pool_risk = True
+        plan.phase_ok = False
         plan.add(users)
         plan.note(f"{rel}: deleted, {users.bit_count()} users")
         return
@@ -153,6 +165,7 @@ def plan_python(dm: DepMap, plan: Plan, rel: str, old: str | None, new: str | No
         plan.warm_ok = plan.hot_ok = False
         plan.all_call_time = False
         plan.pool_risk = True
+        plan.phase_ok = False
         plan.add(users)
         plan.note(f"{rel}: source encoding declaration changed")
         return
@@ -171,6 +184,7 @@ def plan_python(dm: DepMap, plan: Plan, rel: str, old: str | None, new: str | No
         plan.warm_ok = plan.hot_ok = False
         plan.all_call_time = False
         plan.pool_risk = True
+        plan.phase_ok = False
         plan.add(users)
         plan.note(f"{rel}: cannot diff ({e})")
         return
@@ -178,6 +192,7 @@ def plan_python(dm: DepMap, plan: Plan, rel: str, old: str | None, new: str | No
         plan.warm_ok = plan.hot_ok = False
         plan.all_call_time = False
         plan.pool_risk = True
+        plan.phase_ok = False
         plan.add(users)
         plan.note(f"{rel}: new version does not parse; {users.bit_count()} users")
         return
@@ -229,6 +244,10 @@ def plan_python(dm: DepMap, plan: Plan, rel: str, old: str | None, new: str | No
             # imports compute may change for every test that triggers them.
             at_import = dm.lines(rel, lo, hi, kinds=("imp",))
             span = (ch.func[1], ch.func[2]) if ch.func is not None else (lo, hi)
+            if at_import or dm.lines(rel, min(lo, region[0]), max(hi, region[1]), kinds=("imp",)):
+                plan.phase_ok = False       # what imports computed with it may differ as well
+            else:
+                plan.regions.append((rel, min(lo, region[0]), max(hi, region[1])))
             if (at_import and USE_IMPORT_RUNS and rel.startswith("sqlglot/")
                     and not dm.run_by_test_imports(rel, span[0], span[1])):
                 # The code also runs while modules of the package are imported (some build
@@ -266,6 +285,12 @@ def plan_python(dm: DepMap, plan: Plan, rel: str, old: str | None, new: str | No
             plan.all_call_time = False
             plan.hot_ok = False
             plan.import_check.add(mod)
+            if ch.func is not None and not dm.lines(rel, ch.func[1], ch.func[2], kinds=("imp",)):
+                # The signature or a decorator of a function that no import calls: it only
+                # matters where the function is called.
+                plan.regions.append((rel, ch.func[1], ch.func[2]))
+            else:
+                plan.phase_ok = False
             if dm.pickle_time(rel):
                 plan.pool_risk = True
             # What importing the patched module actually changes can be measured (see
@@ -451,6 +476,7 @@ def make_plan(dm: DepMap, src_root: str, files: list[FilePatch], cheap=lambda bi
                     users |= dm.module_users(module_name(rel))
                 plan.blind |= users
                 plan.pool_risk = True
+                plan.phase_ok = False
                 plan.note(f"{rel}: binary change, {users.bit_count()} readers")
             continue
         edits: list = []
@@ -476,6 +502,7 @@ def make_plan(dm: DepMap, src_root: str, files: list[FilePatch], cheap=lambda bi
                     plan.all_call_time = False
                     plan.warm_ok = plan.hot_ok = False
                     plan.pool_risk = True
+                    plan.phase_ok = False
                     plan.add(users)
                     plan.whole_only |= users
                     plan.note(f"{rel}: python outside the package, {users.bit_count()} users")
@@ -483,6 +510,7 @@ def make_plan(dm: DepMap, src_root: str, files: list[FilePatch], cheap=lambda bi
                 continue
             elif rel.startswith("tests/fixtures/"):
                 plan.all_call_time = False
+                plan.phase_fixtures.append(rel)
                 plan_fixture(dm, plan, rel, old, new, src_root, entry_users, helpers_changed)
             else:
                 if rel in ("setup.cfg", "pyproject.toml") and _pytest_section(old) != _pytest_section(new):
@@ -493,6 +521,7 @@ def make_plan(dm: DepMap, src_root: str, files: list[FilePatch], cheap=lambda bi
                 plan.all_call_time = False
                 plan.warm_ok = plan.hot_ok = False
                 plan.pool_risk = True
+                plan.phase_ok = False
                 plan.add(readers)
                 plan.whole_only |= readers
                 plan.note(f"{rel}: read by {readers.bit_count()} tests")

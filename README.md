@@ -60,12 +60,51 @@ CPU time. This entry does both, in that order:
      patch that only changes function bodies no import ever runs, a child forks from that
      process and the affected function objects get the patched code (`verify.apply_swaps`);
      for patches that change no Python code the pinned modules are used as they are;
+   * re-running `TestGenerator::test_generator_memory` on the dialects a patch can reach
+     only (`brh.LOOP_RECIPES`, `Selector.loop_slice`). The test builds 1,100 generators of
+     each of 33 dialects and costs 4.5 s of CPU whenever a change to any dialect, generator
+     or parser module makes it a candidate. What one round of its loop uses is measured on
+     the pinned tree, in a forked child, before anything else of the commit runs: the modules
+     whose code runs, and the modules of the classes that are initialised, handed out by the
+     dialect registry, or set as the dialect's tokenizer, parser and generator. A round is
+     reached when one of those modules is a changed module, a module in which importing the
+     patched tree computed something different, or a module that imports one of them,
+     directly or not, at top level or inside a function. Any other round runs the same code
+     on the same objects as on the pinned commit. Not used when a changed file imports
+     something else than before, or when the import of the patched tree added, removed or
+     failed anything;
    * stopping early once the outcome can no longer change the selection.
 6. **A candidate that was not settled is selected.** Settled means re-run whole, or on
    every affected fixture entry / unit. The one exception is the short list in
    `tools/never_alone.json`: three tests that cost more to re-run than to select, and that
    were measured never to fail on their own (see "How this was checked"). They are left out
    when the change is call-time only and every other candidate was settled and passed.
+   For the executor's TPC-DS test there is one more way to settle it, tried when it would
+   otherwise be selected without having been seen to fail (`brh.PHASE_RECIPES`,
+   `Selector.phase_spec`). The test sends its queries through parse, optimize, plan and the
+   Python executor and compares the rows with DuckDB's; it costs 37 s of CPU to re-run and
+   21 s to select. For one query, everything after the optimizer sees the patched program
+   through two values only: the parsed and the optimized expression. If both are what they
+   are on the pinned commit, and the patch only changes function bodies none of whose lines
+   the query runs outside parsing and optimizing, the rest is unchanged code on unchanged
+   input, and the query does what it does on the pinned commit. So the affected queries are
+   parsed and optimized one by one (3 s for all of them) and compared with a digest of the
+   pinned expressions. When all of them are the same the test is left out; at the first
+   query that differs, or when the patch touches what queries run after the optimizer, the
+   test stays selected as before. Nothing is executed and no fixture is built for this, so
+   a try costs at most the looks, and it is only made when leaving the test out saves more
+   than that. The check is also made beside edits of fixture files that this test does not
+   read. It is never made for patches to the executor or the planner. The digests are made
+   by a walk of the tree that uses no code of the package (`brh.expr_fingerprint`), and the
+   parsed expression is pickled and unpickled before it is digested, as on its way to a
+   worker of the test's pool: a patch to the serialiser (`serde.py`) is settled by what
+   comes out of it. The same looks are used when the test is re-run on the
+   queries a patch reaches (a slice, step 5): there a query that differs, or that runs a
+   changed line after the optimizer, is executed, one at a time, so the outcome is that of
+   executing every reached query, for less CPU.
+   (`Selector.evidence_probe` also holds two bets that leave this test and the parser's
+   29 s test out on indirect evidence. They are switched on in this entry, `BR_RISK=1`: see
+   "Two bets" below.)
 7. **Add the tests that fail because of another test.** `TestOptimizer` makes one process
    pool for the whole class and 22 of its tests use it. A pool breaks for good when a worker
    cannot unpickle a call, or the parent cannot unpickle a result or a raised exception, and
@@ -78,6 +117,39 @@ CPU time. This entry does both, in that order:
    pool-using tests that come after it in the suite's order are selected as well.
 8. **Split** the selected tests over workers to minimise `largest load + 2 s x workers`
    (`selector/split.py`).
+
+(`pin_to_one_cpu`, `BR_PIN`, is switched off. The selector and its children run one after
+the other, and keeping to one CPU took a few percent off the CPU time in most interleaved
+runs, but no more than those runs differ among themselves, so it was not adopted.)
+
+**Two bets on the two most expensive tests** (`Selector.evidence_probe` in
+`selector/main.py`). Up to here a test is selected unless it was shown to pass. For two tests
+that rule is expensive: `TestParser::test_max_nodes` (29 s recorded) and
+`TestExecutor::test_execute_tpcds` (21 s) cost more CPU to re-run than they cost to select, so
+whenever a change can reach them and they were not seen to fail they are selected, mostly for
+nothing. This entry gathers cheaper evidence against the patched tree instead, and leaves the
+test out when the evidence passes. Everything else stays selected.
+
+* **The parser test** builds one statement of a million nodes and expects the parser to
+  refuse it at limits of 1,000,000 and of 50,000 nodes. A stand-in is run in its place: the
+  same test method, recompiled from its source with a statement one hundredth as wide and
+  limits of 4,000 and 5,000 (`RISK_SCALED`; 0.3 s of CPU instead of 30). It has to pass, and
+  in no more than two and a half times the CPU the same stand-in takes on the pinned tree,
+  which is measured once in the same run (`Selector.scaled_limit`). An earlier submission
+  compared with a fixed 0.8 s instead; with every clock the selector reads scaled three
+  times, as on a machine that much slower, that limit ended one of three tries on trial
+  commits, and the limit used now none.
+* **The executor's TPC-DS test**, where the two-phase check of step 6 could not be tried,
+  only when the commit was decided without any re-run and only call-time code changed: the
+  selected cheap tests of its class (under a second each, at least three of them) and the 30
+  cheapest of the other selected tests are re-run, stopping at the first failure. The test
+  is left out when all of them pass and no executor or optimizer test is known to fail.
+
+Neither bet is made when the patch touches anything but the package's own Python code (the
+evidence says nothing about a test whose own code or data changed), when a patched module
+does not import, or when a re-run hung. Class fixtures are built for the evidence run
+whenever every test of the class is a candidate, because then the change may be in what the
+fixture runs. These are bets, not proofs; "How this was checked" says how they did.
 
 Anything the planner cannot analyse (binary patches, hunks that do not apply, changes to
 test-runner configuration) falls back to selecting every test; a re-run that hangs or
@@ -101,10 +173,11 @@ step 2), and that is reasoned from the patch and the maps when the patch arrives
 | `maps/reads.json.z` | per test: which entries of sqlglot's class-level and module-level dicts and sets it looks up, tests for size, or walks | `tools/tracer/run_trace.py --reads` (`tools/tracer/readtrace.py`), `tools/build_map.py --reads` |
 | `maps/cmp.json.z` | per `is` / `is not` comparison in the package: the pairs of operand classes the suite produces there, and per class how it compares for equality (by identity, as a built-in value type, only with its own exact class, never with None, unknown) | `tools/tracer/cmptrace.py`, `tools/build_cmp.py` |
 | `maps/timp.json.z` | functions of the package that the module-level code of test files runs (what that computes stays in the test module, outside the import-state comparison) | `tools/tracer/timp.py` |
+| `maps/phases.json.z` | per query of the executor's TPC tests: digests of its parsed expression (after a pickle round trip) and of its optimized expression, the CPU of getting that far, and the lines it runs outside parsing, that round trip and optimizing (measured in a fresh process per query that starts from the pinned expressions and never runs the parser or optimizer itself) | `tools/tracer/phases.py` |
 | `maps/pools.json.z` | which tests submit calls to a process pool made in a class fixture, and which functions of the package run while a pool pickles or unpickles calls and results | `tools/tracer/pools.py` |
 | `maps/idents.json.z` | where each module-level / class-level name is used in the source | `tools/build_idents.py` |
 | `maps/outline.json.z` | line spans of module-level and class-level statements | `tools/build_outline.py` |
-| `maps/state.json.z` (made by the `Dockerfile`) | module list, static import graph | `tools/build_state.py` |
+| `maps/state.json.z` (made by the `Dockerfile`) | module list, static import graph (top-level imports, and separately every import statement) | `tools/build_state.py` |
 
 `tools/tracer/brtrace.py` is the tracer (`sys.monitoring`); `selector/brh.py` is the test
 harness shared by the tracer and the run-time re-runs, so tests are traced exactly the way
@@ -159,6 +232,7 @@ python $T/cmptrace.py --root /app/src --tests tests.json --together --out /tmp/c
 python /app/tools/build_cmp.py --out maps/cmp.json.z '/tmp/cmp_*.pkl'
 python $T/timp.py --root /app/src --out maps/timp.json.z
 python $T/pools.py --root /app/src --tests tests.json --out maps/pools.json.z
+python $T/phases.py --root /app/src --out maps/phases.json.z
 python /app/tools/build_idents.py /app/src maps/idents.json.z
 python /app/tools/build_outline.py /app/src maps/outline.json.z
 ```
@@ -201,6 +275,74 @@ at run time, except the three test names in `tools/never_alone.json`.
   fixture-driven optimizer tests (they are often the only test to notice a change), so it
   was removed. What remains is the list of three tests, each of which failed dozens of
   times on trial edits and never as the only failing test.
+
+* **Two phases for the executor's TPC-DS test.** On the labelled sets (1,482 commits: the
+  30 of the sample, 1,175 labelled by full `pytest` runs, 53 by `pytest` on the optimizer
+  tests with real pools, 224 by re-running every candidate) the check settles the test as
+  passing in 33 commits, and no failing test is left out. 2,303 fresh single-token edits
+  (the sample's operator mix, one random file each) were run through the selector as well,
+  and the test was then run for real under `pytest` wherever the check had settled it: it
+  passes in all of them (25 commits at the time, 55 with the later forms described
+  below). A first build of the map got one of these wrong, an edit to a lambda in the
+  executor's operator table: the tracer listened for line events only,
+  and CPython 3.13 delivers those for a function that consists of a single line only while
+  function starts are monitored as well, so the lines of such functions were missing from
+  what queries run after the optimizer. The tracer now monitors both, the map was rebuilt
+  (48 more lines), digests are compared across six hash seeds, and changes to the executor
+  and the planner are excluded outright. A form that also executed the few queries that
+  differ was tried and given up: what it cost depended too much on the machine. Where the
+  test is re-run on the queries a patch reaches, the looks only save executions (used in
+  31 labelled and 73 fresh commits); the selections there are the ones executing every
+  reached query gives. A wider form was tried last and taken back: it also looked at the
+  SQL text the test sends to DuckDB, so that edits to the parser and the DuckDB generator
+  would no longer rule the check out. 2,480 edits were made on purpose on the lines that
+  form newly covered, and the test was run for real under `pytest` wherever it had been
+  left out: it fails in 3 of 90. All three break the lazy loading of dialects in the
+  registry; the selector's process has every dialect module loaded, so the look saw
+  nothing, while the test's own process asks for "duckdb" first there. The look at the
+  DuckDB text is gone, and with it the map goes back to the one before. What stays from
+  that round is the check beside fixture edits the test does not read. Patches to the
+  serialiser came under the check afterwards, and were tested the same way before anything
+  was claimed: every single-token edit of the sample's kinds on the 70 sites of the lines
+  the test runs while it pickles (`serde.py`, `Expr.__reduce__`), with the real test run
+  under `pytest` on each. The real test fails in 49 of them, and in every one of those
+  the test is selected; the selector leaves it out in 19 (this check in 3 of them), and
+  it passes in all 19.
+  With the digest made without the package the check settles the test in 35 of the
+  labelled commits (no failing test left out) and in 55 of the 2,303 fresh edits, the
+  same commits as before.
+
+* **Generator memory test on the reached dialects only.** On the labelled sets (1,482
+  commits) the shortened re-run is used in 34 commits and no failing test is left out. On
+  the 2,303 fresh edits it is used in 86 commits; the whole test was then run for real
+  under `pytest` for each of them and passes in all 86, as the shortened one did. Among
+  the labelled commits there are two where it is used and the whole test fails: the
+  shortened one fails there too. Nine labelled commits that used to be decided without a
+  re-run (300 tests selected, none or a handful failing) are now re-run and settled,
+  because the test no longer makes the re-run cost more than the selection.
+
+* **The two bets.** They were first written wider and narrowed by what went wrong. 2,303
+  fresh single-token edits (the sample's operator mix, one random file each) were run through
+  the selector, and for every commit where a bet left a test out that test was then run for
+  real under `pytest`. Asking the executor test's cheap neighbours alone was wrong in 4 of 86
+  such commits, and in 3 more among the labelled commits: after a re-run of the other
+  candidates the expensive test is often one of the few tests left that could notice the
+  change; a change that breaks the generator shows in the dialect tests and not in the
+  executor's cheap ones; and one edit to a module's import-time code made tests fail only
+  after others had run. Hence the restrictions above. In the form described here the same
+  2,303 edits give 41 commits where a bet leaves a test out (the executor test in 10, the
+  parser test in 31), and the real run of that test passes in all 41. On the labelled sets
+  (1,482 commits: the 30 of the sample, 1,175 labelled by full `pytest` runs, 53 by `pytest`
+  on the optimizer tests with real pools, 224 by re-running every candidate) no failing test
+  is left out; the bets leave the parser test out in 57 of those commits and the executor
+  test in 10, and take 587 s (4.6%) of selection out of them. The stand-in of the parser
+  test agreed with the real test on all 37 labelled commits tried one by one, 12 of them
+  commits where the real test fails. A wider form of evidence for the executor test, every
+  candidate of its own class and of the optimizer's (on the labelled sets the test never
+  fails without one of those failing, 205 failures), was implemented and left off
+  (`BR_RISK_CLASS`): gathering it costs about what leaving the test out saves. The
+  restrictions and thresholds of the bets come from these trial edits; no outcome of any
+  edit is stored or looked up.
 
 ## Build and run
 
