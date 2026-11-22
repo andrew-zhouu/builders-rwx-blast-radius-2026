@@ -377,7 +377,7 @@ def _sliced_loop(orig, recipe: dict, only):
 PHASE_RECIPES = {
     "tests/test_executor.py::TestExecutor::test_execute_tpcds":
         {"sqls": "tpcds_sqls", "tables": "tpcds_tables", "schema": "TPCDS_SCHEMA",
-         "file": "optimizer/tpc-ds/tpc-ds.sql"},
+         "file": "optimizer/tpc-ds/tpc-ds.sql", "conn": "tpcds_conn"},
     "tests/test_executor.py::TestExecutor::test_execute_tpch":
         {"sqls": "tpch_sqls", "tables": "tpch_tables", "schema": "TPCH_SCHEMA",
          "file": "optimizer/tpc-h/tpc-h.sql"},
@@ -516,6 +516,114 @@ class _NoRows(dict):
         return Table()
 
 
+# -- DuckDB's reference answers, replayed ----------------------------------------------------
+# The executor's TPC-DS test compares each query's rows with what DuckDB returns for the
+# query's DuckDB text. That answer depends on the text and on the fixture tables, not on the
+# patched package, and computing it is nearly half of the test's CPU. maps/duck.bin holds
+# the frames DuckDB returned on the pinned commit (tools/build_duck.py), keyed by a digest of
+# the text. The stand-in below answers a text it knows from the record and hands anything
+# else to DuckDB, so a patch that changes the text a query is transpiled to is still
+# answered by DuckDB itself. It is only put in place where the fixture is the pinned one
+# (the two-phase runner: package code changed, no test code or data the test reads).
+_DUCK: list = []
+
+
+def duck_answers() -> dict:
+    if not _DUCK:
+        import os
+        import pickle
+
+        answers: dict = {}
+        try:
+            path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps", "duck.bin")
+            with open(os.environ.get("BR_DUCK_MAP", path), "rb") as f:
+                answers = pickle.load(f).get("answers") or {}
+        except Exception:  # noqa: BLE001 - no record: DuckDB answers everything
+            answers = {}
+        _DUCK.append(answers)
+    return _DUCK[0]
+
+
+class DuckReplay:
+    def __init__(self, real, answers: dict):
+        self._real = real
+        self._answers = answers
+
+    def execute(self, query, *args, **kwargs):
+        if not args and not kwargs and type(query) is str:
+            import hashlib
+
+            blob = self._answers.get(hashlib.sha1(query.encode("utf-8", "surrogatepass")).hexdigest())
+            if blob is not None:
+                return DuckAnswer(self._real, query, blob)
+        return self._real.execute(query, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class DuckAnswer:
+    """What execute() returned for a recorded text: fetchdf() gives a fresh copy of the
+    recorded frame; anything else is asked of DuckDB after all."""
+
+    def __init__(self, real, query: str, blob: bytes):
+        self._real, self._query, self._blob = real, query, blob
+
+    def fetchdf(self):
+        import pickle
+        import zlib
+
+        return pickle.loads(zlib.decompress(self._blob))
+
+    def __getattr__(self, name):
+        return getattr(self._real.execute(self._query), name)
+
+
+class PhaseTimeout(BaseException):
+    """A query of a two-phase run used up its CPU allowance."""
+
+
+def _cpu_timer():
+    """timer(seconds) arms a CPU-time alarm that raises PhaseTimeout in this process,
+    timer(0) disarms it, timer(None) puts the previous handler back. Does nothing where the
+    interval timer is not available."""
+    import signal
+
+    state = {"old": None, "ok": True}
+
+    def on_alarm(signum, frame):
+        raise PhaseTimeout()
+
+    try:
+        state["old"] = signal.signal(signal.SIGVTALRM, on_alarm)
+    except (AttributeError, ValueError, OSError):
+        state["ok"] = False
+
+    def timer(seconds):
+        if not state["ok"]:
+            return
+        try:
+            if seconds is None:
+                signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+                signal.signal(signal.SIGVTALRM, state["old"] if state["old"] is not None else signal.SIG_DFL)
+            else:
+                signal.setitimer(signal.ITIMER_VIRTUAL, float(seconds))
+        except (AttributeError, ValueError, OSError):
+            state["ok"] = False
+
+    return timer
+
+
+def _replay_duck(cls, recipe: dict) -> None:
+    name = recipe.get("conn")
+    answers = duck_answers() if name else None
+    if not answers:
+        return
+    conn = cls.__dict__.get(name)
+    if conn is not None and not isinstance(conn, DuckReplay):
+        setattr(cls, name, DuckReplay(conn, answers))
+
+
 def _phased_method(orig, spec: dict, recipe: dict, test_id: str):
     def run(self):
         import sqlglot.executor as ex
@@ -551,6 +659,8 @@ def _phased_method(orig, spec: dict, recipe: dict, test_id: str):
         todo = [pos for pos in range(len(sqls)) if must_run(pos)]
         owed = sum(cost.get(str(index[pos]), 0.5) for pos in todo)
         log[1] = len(todo)
+        owed_first = len(todo)
+        max_rate = spec.get("max_rate", 0.0)
         if owed > limit or len(todo) > max_differ:
             UNVERIFIED.append(test_id)
             return
@@ -585,7 +695,10 @@ def _phased_method(orig, spec: dict, recipe: dict, test_id: str):
                 # When the optimizer gives the first queries, or many of them, another shape,
                 # looking is no shortcut: the test stays unsettled (and selected).
                 many = spec.get("bail", True) and ((log[1] >= 2 and 4 * log[1] > log[0]) or log[1] > max_differ)
-                if owed > limit or many:
+                # (when the differing queries are to be run: a patch that gives most of the
+                # first queries another shape changes too much for that to pay)
+                wide = max_rate and log[0] >= 4 and (log[1] - owed_first) > max_rate * log[0]
+                if owed > limit or many or wide:
                     UNVERIFIED.append(test_id)
                     return
         finally:
@@ -609,19 +722,34 @@ def _phased_method(orig, spec: dict, recipe: dict, test_id: str):
                 return
             sqls = full
         te.initializer(getattr(te, recipe["schema"]), getattr(cls, recipe["tables"]))
-        for pos in sorted(todo, key=lambda q: (cost.get(str(index[q]), 0.5), q)):
-            if max_cpu is not None and _cpu_now() - t0 > max_cpu + limit:
-                UNVERIFIED.append(test_id)
-                return
-            log[2] += 1
-            setattr(cls, recipe["sqls"], [sqls[pos]])
-            try:
-                orig()
-            finally:
-                setattr(cls, recipe["sqls"], sqls)
-            outcome = getattr(self, "_outcome", None)
-            if outcome is not None and not getattr(outcome, "success", True):
-                return                      # a query fails: so does the test
+        if spec.get("replay"):
+            _replay_duck(cls, recipe)
+        # A patched optimizer or executor can make a query run for minutes (a join without
+        # its condition, say). Each query gets a CPU allowance of several times what it costs
+        # on the pinned commit; past it the test is left unsettled, as it was before the try.
+        timer = _cpu_timer()
+        try:
+            for pos in sorted(todo, key=lambda q: (cost.get(str(index[q]), 0.5), q)):
+                if max_cpu is not None and _cpu_now() - t0 > max_cpu + limit:
+                    UNVERIFIED.append(test_id)
+                    return
+                log[2] += 1
+                setattr(cls, recipe["sqls"], [sqls[pos]])
+                timer(max(2.0, 6.0 * cost.get(str(index[pos]), 0.5) + 1.0))
+                try:
+                    orig()
+                except PhaseTimeout:
+                    UNVERIFIED.append(test_id)
+                    return
+                finally:
+                    timer(0)
+                    setattr(cls, recipe["sqls"], sqls)
+                outcome = getattr(self, "_outcome", None)
+                if outcome is not None and not getattr(outcome, "success", True):
+                    return                  # a query fails (or ran out of its allowance inside
+                    #                         a subtest, which counts the same): so does the test
+        finally:
+            timer(None)
 
     return run
 
@@ -721,12 +849,172 @@ def _cap_duckdb_threads() -> None:
     orig = duckdb.connect
 
     def connect(*args, **kwargs):
+        seed = repr((args, sorted(kwargs.items(), key=repr)))
         if len(args) < 3 and "config" not in kwargs:
             kwargs["config"] = {"threads": DUCKDB_THREADS}
-        return orig(*args, **kwargs)
+        real = orig(*args, **kwargs)
+        if DUCK_ALL or DUCK_RECORD is not None:
+            return DuckConn(real, _duck_digest("connect\0" + seed))
+        return real
 
     connect._br_capped = True
     duckdb.connect = connect
+
+
+# -- every DuckDB connection the tests open ---------------------------------------------------
+# What DuckDB returns for a read-only statement depends on the statement and on what was done
+# to the database before, not on the patched package. DuckConn keeps a digest of everything
+# that could have changed the database of its connection: the connect arguments and, in
+# order, every statement that is not plainly a query. A query whose text, in that state, is
+# in the record of the pinned suite (maps/duck.bin, tools/build_duck.py) gets the recorded
+# rows without DuckDB running it; every other statement goes to DuckDB as before, and
+# anything the stand-in does not follow (parameters, other methods) ends the replay for that
+# connection. DUCK_ALL is set per run, only for patches that touch nothing but the package's
+# Python code: the tables the fixtures load from files are then the pinned ones.
+DUCK_ALL = False
+DUCK_RECORD: dict | None = None      # tools/build_duck.py: the record being made
+_DUCK_RE: list = []
+
+
+def _duck_digest(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _duck_norm(text: str) -> str:
+    """The statement without the place the tree happens to be at."""
+    if not _DUCK_RE:
+        import re
+
+        _DUCK_RE.append(re.compile(r"'[^']*?/tests/fixtures/"))
+        _DUCK_RE.append(re.compile(
+            r"\b(insert|update|delete|create|drop|alter|copy|attach|detach|pragma|install|load|call|truncate|"
+            r"merge|set|export|import|vacuum|checkpoint|nextval|use|begin|commit|rollback)\b"))
+    return _DUCK_RE[0].sub("'<fixtures>/", text)
+
+
+def _duck_query(norm: str) -> bool:
+    """Plainly a query: starts like one and names nothing that writes."""
+    low = norm.lstrip().lower()
+    return low.startswith(("select", "with", "from", "values", "(")) and not _DUCK_RE[1].search(low)
+
+
+class DuckConn:
+    def __init__(self, real, state: str):
+        self._real = real
+        self._state = state          # None: no longer known
+
+    def execute(self, query, *args, **kwargs):
+        if args or kwargs or type(query) is not str or self._state is None:
+            self._state = None
+            return self._real.execute(query, *args, **kwargs)
+        norm = _duck_norm(query)
+        if not _duck_query(norm):
+            self._state = _duck_digest(self._state + "\0" + norm)
+            self._real.execute(query)
+            return self
+        base = self._state + "\0" + norm
+        if DUCK_RECORD is not None:
+            self._real.execute(query)
+            return _DuckRecording(self._real, query, base)
+        answers = duck_answers()
+        rows, frame = answers.get(_duck_digest("rows\0" + base)), answers.get(_duck_digest("frame\0" + base))
+        if rows is None and frame is None:
+            self._real.execute(query)        # not in the record: DuckDB answers (and raises, if it must)
+            return _DuckLive(self._real)
+        return _DuckKnown(self._real, query, rows, frame)
+
+    def close(self):
+        return self._real.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._real.close()
+        return False
+
+    def __getattr__(self, name):
+        self._state = None
+        return getattr(self._real, name)
+
+
+class _DuckLive:
+    """The result of a query DuckDB has just run."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _DuckKnown:
+    """The result of a query the pinned suite sent in the same state: it succeeded there."""
+
+    def __init__(self, real, query, rows, frame):
+        self._real, self._query, self._rows, self._frame = real, query, rows, frame
+
+    @staticmethod
+    def _load(blob):
+        import pickle
+        import zlib
+
+        return pickle.loads(zlib.decompress(blob))
+
+    def fetchall(self):
+        if self._rows is not None:
+            return self._load(self._rows)
+        return self._real.execute(self._query).fetchall()
+
+    def df(self, *args, **kwargs):
+        if self._frame is not None and not args and not kwargs:
+            return self._load(self._frame)
+        return self._real.execute(self._query).df(*args, **kwargs)
+
+    def fetchdf(self, *args, **kwargs):
+        return self.df(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real.execute(self._query), name)
+
+
+class _DuckRecording:
+    """Recording: the query has been run; what is fetched is kept when DuckDB gives the same
+    answer a second time."""
+
+    def __init__(self, real, query, base):
+        self._real, self._query, self._base = real, query, base
+
+    def _keep(self, kind, value, again, same):
+        import pickle
+        import zlib
+
+        try:
+            if same(value, again):
+                DUCK_RECORD[_duck_digest(kind + "\0" + self._base)] = zlib.compress(pickle.dumps(value, protocol=4), 6)
+        except Exception:  # noqa: BLE001 - not comparable or not picklable: never replayed
+            pass
+        return value
+
+    def fetchall(self):
+        value = self._real.fetchall()
+        again = self._real.execute(self._query).fetchall()
+        return self._keep("rows", value, again, lambda a, b: a == b and repr(a) == repr(b))
+
+    def df(self, *args, **kwargs):
+        value = self._real.df(*args, **kwargs)
+        if args or kwargs:
+            return value
+        again = self._real.execute(self._query).df()
+        return self._keep("frame", value, again, lambda a, b: a.equals(b) and list(a.dtypes) == list(b.dtypes))
+
+    def fetchdf(self, *args, **kwargs):
+        return self.df(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 NOT_RUN: list[str] = []

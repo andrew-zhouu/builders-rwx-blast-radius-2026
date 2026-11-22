@@ -64,6 +64,7 @@ class DepMap:
         self._pools: list | None = None
         self._pickle: dict | None = None
         self._phases: dict | None = None
+        self._duck: dict | None = None
         # simple class name -> full keys ("module:Qual.Name"), for classes some test instantiates
         self.class_by_name: dict[str, list[str]] = {}
         for key in self.classes:
@@ -191,6 +192,22 @@ class DepMap:
                                      "by_file": by_file,
                                      "other": {k: int(v, 16) for k, v in rec["other"].items()}}
         return self._phases
+
+    def duck_costs(self) -> dict | None:
+        """{query index: CPU seconds of one query of the executor's TPC-DS test once DuckDB's
+        answer is at hand} (tools/build_duck.py), or None without the record."""
+        if self._duck is None:
+            import pickle
+
+            self._duck = {}
+            try:
+                with open(os.path.join(os.path.dirname(self._pools_path), "duck.bin"), "rb") as f:
+                    data = pickle.load(f)
+                if data.get("answers"):
+                    self._duck = {int(k): float(v) for k, v in (data.get("exec_cpu") or {}).items()}
+            except Exception:  # noqa: BLE001 - no record
+                self._duck = {}
+        return self._duck or None
 
     def shared_pools(self) -> list[int]:
         """Sets of tests that submit calls to one process pool made in a class fixture

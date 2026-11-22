@@ -94,6 +94,9 @@ PHASE_SLICES = int(_f("BR_PHASE_SLICES", 1))  # the same looks when the test is 
 PHASE_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 PHASE_AFTER = ("sqlglot/executor/", "sqlglot/planner.py")
 PHASE_DATA = ("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")   # what the test reads
+PHASE_BUDGET_S = _f("BR_PHASE_BUDGET", 8.0)   # ... for at most this many seconds of queries (the map's seconds)
+USE_DUCK_ALL = int(_f("BR_DUCK_ALL", 0))      # recorded answers for the read-only statements tests send to DuckDB
+USE_DUCK = int(_f("BR_DUCK", 0))              # run the queries the looks cannot vouch for, DuckDB's answers replayed
 PHASE_MORE = int(_f("BR_PHASE_MORE", 1))      # also beside edits of fixture files the test does not read
 # Leaving an expensive test out on the evidence of its neighbours (off by default; see
 # Selector.evidence_probe).
@@ -568,7 +571,9 @@ class Selector:
                 if (i is None or rel.startswith(PHASE_DATA) or (self.dm.openers(rel) >> i) & 1
                         or any(rel.endswith(name) for name in mine)):
                     return None     # the test reads the edited file
-        if any(rel.startswith(PHASE_AFTER) for rel in plan.changed):
+        exec_cpu = self.dm.duck_costs() if USE_DUCK and tid == PHASE_TEST else None
+        after = any(rel.startswith(PHASE_AFTER) for rel in plan.changed)
+        if after and exec_cpu is None:
             return None     # the executor and the planner are what runs after the optimizer
         ph = self.dm.phases().get(tid)
         if ph is None:
@@ -580,20 +585,27 @@ class Selector:
                     mask |= 1 << bit
         eligible = []
         look = owed = 0.0
+        priced = []
         for c, f, k in costs:
             if f != ph["file"]:
                 return None
+            if exec_cpu is not None:
+                # what running the query costs once DuckDB's answer is at hand (a query the
+                # test only parses costs next to nothing)
+                c = exec_cpu.get(int(k), 0.01)
+            priced.append((c, f, k))
             other = ph["other"].get(str(k))
-            if other is None or ph["fp"].get(str(k)) is None or other & mask:
+            if after or other is None or ph["fp"].get(str(k)) is None or other & mask:
                 owed += c
             else:
                 eligible.append(k)
                 look += ph["opt_cpu"].get(str(k), 0.1)
-        if not eligible:
+        if not eligible and exec_cpu is None:
             return None
         return look, owed, {"fp": {str(k): ph["fp"][str(k)] for k in eligible}, "eligible": eligible,
-                            "cost": {str(k): round(c, 3) for c, _, k in costs}, "max_exec": PHASE_EXEC_S,
-                            "look_cost": {str(k): ph["opt_cpu"].get(str(k), 0.1) for k in eligible}}
+                            "cost": {str(k): round(c, 3) for c, _, k in priced}, "max_exec": PHASE_EXEC_S,
+                            "look_cost": {str(k): ph["opt_cpu"].get(str(k), 0.1) for k in eligible},
+                            "replay": exec_cpu is not None}
 
     def after_pool_break(self, risky: int, broke: int = 0) -> int:
         """Tests that fail when one of `risky` breaks a process pool.
@@ -1215,16 +1227,26 @@ class Selector:
                 saves = (best_split({n: self.ms[n] for n in selected})[0]
                          - best_split({n: self.ms[n] for n in selected if n != phase_n})[0]) / 1000.0
                 report["phase_saves"] = round(saves, 1)
-                if PHASE_MORE and saves < 1.5 * (look + owed + setup) + 1.0:
+                budget = 0.0
+                if what.get("replay"):
+                    # With DuckDB's answers at hand the queries the looks cannot vouch for
+                    # are run. They may cost what keeps the whole try under what leaving
+                    # the test out saves (the fixture is only built once a query has to run).
+                    setup = dm.class_setup.get(cls_key, 0.0)
+                    budget = round(min(PHASE_BUDGET_S, (saves - 0.5) / 1.2 - look - setup), 2)
+                    report["phase_budget"] = budget
+                if PHASE_MORE and saves < 1.5 * (look + owed + (setup if owed else 0.0)) + 1.0:
                     report["phase_why"] = "saves too little"
-                elif owed <= PHASE_EXEC_S and look + owed + setup <= PHASE_PROBE_S:
+                elif (owed <= budget) if budget > 0 else (owed <= PHASE_EXEC_S and look + owed + setup <= PHASE_PROBE_S):
                     flt: dict = {}
                     for _, f, q in (() if phase_all else self._phase_costs):
                         flt.setdefault(f, set()).add(q)
                     # A ceiling; the looks watch their own pace. Both leave room for a machine
                     # several times slower than the one the map's seconds were measured on.
                     what["max_cpu"] = round(10.0 * look + 4.0, 2)
-                    if not PHASE_EXEC_S:
+                    if budget > 0:
+                        what.update(max_exec=budget, max_differ=10 ** 9, bail=False, max_rate=0.5)
+                    elif not PHASE_EXEC_S:
                         # Looks only: the first query that differs leaves the test unsettled, no
                         # fixture is built and nothing is executed, so what a try costs is
                         # bounded by the looks whatever the machine.
@@ -1233,7 +1255,7 @@ class Selector:
                     phase_group = {"ids": [PHASE_TEST], "filter": {f: sorted(ks) for f, ks in flt.items()},
                                    "skip_setup": [cls_key], "if_failed": False, "own_setup": True}
                     phase_est = look + owed + setup
-                    phase_wall = what["max_cpu"] + PHASE_EXEC_S * 2 + 4.0
+                    phase_wall = what["max_cpu"] + max(PHASE_EXEC_S, budget) * 3 + 8.0
         if not risk and phase_group is None:
             report["outcome"] = "not tried"
             return workers
@@ -1482,6 +1504,10 @@ class Selector:
             raise planned
         else:
             files, plan = planned
+        # Recorded DuckDB answers stand for the pinned fixtures: only when the patch touches
+        # nothing but the package's Python code.
+        verify.DUCK_ALL = bool(USE_DUCK_ALL) and bool(plan.changed) and all(
+            f.startswith("sqlglot/") and f.endswith(".py") for f in plan.changed)
         info["notes"] = plan.notes
         if plan.select_all:
             info["decision"] = "all"

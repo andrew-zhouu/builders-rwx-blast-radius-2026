@@ -262,6 +262,9 @@ def enter_patched_world(overlay: str, harness_dir: str, warm_root: str | None = 
             pass
 
 
+DUCK_ALL = False     # set by the selector per commit (the patch touches package code only)
+
+
 def run_groups(groups: list[dict], drops: dict | None = None, stop_after: int = 0,
                keep: dict | None = None, scale: dict | None = None, phased: dict | None = None,
                loops: dict | None = None) -> dict:
@@ -282,6 +285,7 @@ def run_groups(groups: list[dict], drops: dict | None = None, stop_after: int = 
     brh.KEEP_STATEMENTS.update(keep or {})
     brh.SCALE_TESTS.update(scale or {})
     brh.PHASED.update(phased or {})        # tests settled in two phases (brh.PHASE_RECIPES)
+    brh.DUCK_ALL = bool(DUCK_ALL)          # recorded answers for read-only DuckDB statements
     brh.LOOP_SLICE.update(loops or {})     # tests whose loop is cut down (brh.LOOP_RECIPES)
     report_times = bool(os.environ.get("BR_REPORT"))
     if scale and brh.TIMES is None:
