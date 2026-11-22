@@ -63,6 +63,7 @@ class DepMap:
         self._pools_path = os.path.join(os.path.dirname(path), "pools.json.z")
         self._pools: list | None = None
         self._pickle: dict | None = None
+        self._phases: dict | None = None
         # simple class name -> full keys ("module:Qual.Name"), for classes some test instantiates
         self.class_by_name: dict[str, list[str]] = {}
         for key in self.classes:
@@ -168,6 +169,28 @@ class DepMap:
         if self._timp is None:
             return True
         return any(a <= hi and lo <= b for a, b in self._timp.get(rel, ()))
+
+    def phases(self) -> dict:
+        """Per test that can be settled in two phases (tools/tracer/phases.py):
+        {"file": fixture file, "fp": {entry: [parsed, optimized] or None}, "opt_cpu": {entry: s},
+         "index": {(file, line): bit}, "other": {entry: bits of the lines the entry runs
+         outside parsing and optimizing}}."""
+        if self._phases is None:
+            self._phases = {}
+            try:
+                data = load(os.path.join(os.path.dirname(self._pools_path), "phases.json.z"))
+            except (OSError, ValueError, KeyError, zlib.error):
+                data = {}
+            for tid, rec in data.get("tests", {}).items():
+                if tid not in self.index:
+                    continue
+                by_file: dict[str, list] = {}
+                for bit, (rel, line) in enumerate(rec["lines"]):
+                    by_file.setdefault(rel, []).append((line, bit))
+                self._phases[tid] = {"file": rec["file"], "fp": rec["fp"], "opt_cpu": rec["opt_cpu"],
+                                     "by_file": by_file,
+                                     "other": {k: int(v, 16) for k, v in rec["other"].items()}}
+        return self._phases
 
     def shared_pools(self) -> list[int]:
         """Sets of tests that submit calls to one process pool made in a class fixture
