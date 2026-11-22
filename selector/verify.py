@@ -263,7 +263,7 @@ def enter_patched_world(overlay: str, harness_dir: str, warm_root: str | None = 
 
 
 def run_groups(groups: list[dict], drops: dict | None = None, stop_after: int = 0,
-               keep: dict | None = None) -> dict:
+               keep: dict | None = None, scale: dict | None = None, phased: dict | None = None) -> dict:
     """Run groups of tests in order in this process. A group is
       {"ids": [test id], "filter": {fixture file: [entries]}, "skip_setup": [class key],
        "if_failed": bool}
@@ -279,6 +279,11 @@ def run_groups(groups: list[dict], drops: dict | None = None, stop_after: int = 
 
     brh.DROP_STATEMENTS.update(drops or {})
     brh.KEEP_STATEMENTS.update(keep or {})
+    brh.SCALE_TESTS.update(scale or {})
+    brh.PHASED.update(phased or {})        # tests settled in two phases (brh.PHASE_RECIPES)
+    report_times = bool(os.environ.get("BR_REPORT"))
+    if scale and brh.TIMES is None:
+        brh.TIMES = {}      # how long a stand-in takes is part of what it shows
     if os.environ.get("BR_REPORT"):
         brh.TIMES = {}
     t_start = time.process_time()
@@ -311,7 +316,11 @@ def run_groups(groups: list[dict], drops: dict | None = None, stop_after: int = 
             stopped_early = True
     out = {"failed": failed, "unverified": list(brh.UNVERIFIED), "not_run": list(brh.NOT_RUN),
            "deferred": deferred, "pool_breaks": list(brh.POOL_BREAKS), "bad_files": sorted(brh.BAD_FILES)}
-    if brh.TIMES is not None:
+    if scale:
+        out["scaled_s"] = {t: round(brh.TIMES.get(t, -1.0), 3) for t in scale}
+    if brh.PHASE_LOG:
+        out["phase"] = dict(brh.PHASE_LOG)     # test: [queries looked at, left, executed]
+    if brh.TIMES is not None and report_times:
         top = sorted(brh.TIMES.items(), key=lambda kv: -kv[1])[:12]
         out["times"] = {"total": round(time.process_time() - t_start, 3),
                         "tests": round(sum(v for v in brh.TIMES.values() if v > 0), 3),
@@ -408,7 +417,7 @@ def failing_imports(names) -> dict:
 
 def run_tests(overlay: str, harness_dir: str, groups, timeout: float = 30.0, drops=None, stop_after: int = 0,
               warm_root: str | None = None, parent_root: str | None = None, swaps=None, keep=None,
-              check=None):
+              check=None, scale=None, phased=None):
     """Re-run the groups against the patched tree in one child; None when it hung or died.
 
     swaps: with warm_root, functions whose code is replaced in the child (apply_swaps);
@@ -422,7 +431,7 @@ def run_tests(overlay: str, harness_dir: str, groups, timeout: float = 30.0, dro
                 apply_swaps(swaps)
             except Unswappable as e:
                 return {"unswappable": str(e)}
-        out = run_groups(groups, drops, stop_after, keep)
+        out = run_groups(groups, drops, stop_after, keep, scale, phased)
         if check:
             out["import_failed"] = failing_imports(check)
         return out
