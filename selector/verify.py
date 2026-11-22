@@ -263,7 +263,8 @@ def enter_patched_world(overlay: str, harness_dir: str, warm_root: str | None = 
 
 
 def run_groups(groups: list[dict], drops: dict | None = None, stop_after: int = 0,
-               keep: dict | None = None) -> dict:
+               keep: dict | None = None, scale: dict | None = None, phased: dict | None = None,
+               loops: dict | None = None) -> dict:
     """Run groups of tests in order in this process. A group is
       {"ids": [test id], "filter": {fixture file: [entries]}, "skip_setup": [class key],
        "if_failed": bool}
@@ -279,6 +280,12 @@ def run_groups(groups: list[dict], drops: dict | None = None, stop_after: int = 
 
     brh.DROP_STATEMENTS.update(drops or {})
     brh.KEEP_STATEMENTS.update(keep or {})
+    brh.SCALE_TESTS.update(scale or {})
+    brh.PHASED.update(phased or {})        # tests settled in two phases (brh.PHASE_RECIPES)
+    brh.LOOP_SLICE.update(loops or {})     # tests whose loop is cut down (brh.LOOP_RECIPES)
+    report_times = bool(os.environ.get("BR_REPORT"))
+    if scale and brh.TIMES is None:
+        brh.TIMES = {}      # how long a stand-in takes is part of what it shows
     if os.environ.get("BR_REPORT"):
         brh.TIMES = {}
     t_start = time.process_time()
@@ -311,7 +318,11 @@ def run_groups(groups: list[dict], drops: dict | None = None, stop_after: int = 
             stopped_early = True
     out = {"failed": failed, "unverified": list(brh.UNVERIFIED), "not_run": list(brh.NOT_RUN),
            "deferred": deferred, "pool_breaks": list(brh.POOL_BREAKS), "bad_files": sorted(brh.BAD_FILES)}
-    if brh.TIMES is not None:
+    if scale:
+        out["scaled_s"] = {t: round(brh.TIMES.get(t, -1.0), 3) for t in scale}
+    if brh.PHASE_LOG:
+        out["phase"] = dict(brh.PHASE_LOG)     # test: [queries looked at, left, executed]
+    if brh.TIMES is not None and report_times:
         top = sorted(brh.TIMES.items(), key=lambda kv: -kv[1])[:12]
         out["times"] = {"total": round(time.process_time() - t_start, 3),
                         "tests": round(sum(v for v in brh.TIMES.values() if v > 0), 3),
@@ -408,7 +419,7 @@ def failing_imports(names) -> dict:
 
 def run_tests(overlay: str, harness_dir: str, groups, timeout: float = 30.0, drops=None, stop_after: int = 0,
               warm_root: str | None = None, parent_root: str | None = None, swaps=None, keep=None,
-              check=None):
+              check=None, scale=None, phased=None, loops=None):
     """Re-run the groups against the patched tree in one child; None when it hung or died.
 
     swaps: with warm_root, functions whose code is replaced in the child (apply_swaps);
@@ -422,9 +433,81 @@ def run_tests(overlay: str, harness_dir: str, groups, timeout: float = 30.0, dro
                 apply_swaps(swaps)
             except Unswappable as e:
                 return {"unswappable": str(e)}
-        out = run_groups(groups, drops, stop_after, keep)
+        out = run_groups(groups, drops, stop_after, keep, scale, phased, loops)
         if check:
             out["import_failed"] = failing_imports(check)
+        return out
+
+    return fork_call(job, timeout)
+
+
+def dialect_uses(src_root: str, timeout: float = 30.0):
+    """{value of a member of sqlglot.dialects.Dialects: modules of the package that building
+    a generator of that dialect uses on the pinned tree}, measured in a forked child: the
+    modules whose code runs (functions, class and module bodies), the modules of the classes
+    of every object that gets initialised, of every class handed out by the dialect registry,
+    and of the dialect's own tokenizer, parser and generator classes. None when it failed."""
+
+    def job():
+        if "sqlglot" not in sys.modules:
+            sys.path[:] = [src_root] + [p for p in sys.path if p != src_root]
+        from sqlglot.dialects.dialect import Dialect, Dialects
+
+        root = os.path.join(os.path.abspath(src_root), "")
+        mon = sys.monitoring
+        tool = 1                # (4 is the warm-up's, see _MON_TOOL)
+        mon.use_tool_id(tool, "loops")
+        cur: set = set()
+
+        def module_of(filename: str):
+            if not filename.startswith(root) or not filename.endswith(".py"):
+                return None
+            rel = filename[len(root):-3].replace(os.sep, ".")
+            return rel[:-9] if rel.endswith(".__init__") else rel
+
+        def classes(klass):
+            for base in getattr(klass, "__mro__", ()):
+                m = getattr(base, "__module__", "") or ""
+                if m == "sqlglot" or m.startswith("sqlglot."):
+                    cur.add(m)
+
+        def on_start(code, offset):
+            m = module_of(code.co_filename)
+            if m is not None:
+                cur.add(m)
+                if code.co_name == "__init__":
+                    try:
+                        obj = sys._getframe(1).f_locals.get("self")
+                    except Exception:  # noqa: BLE001
+                        obj = None
+                    if obj is not None:
+                        classes(type(obj))
+
+        def on_return(code, offset, value):
+            if isinstance(value, type) and module_of(code.co_filename) is not None:
+                classes(value)          # a class looked up by name (the dialect registry)
+
+        mon.register_callback(tool, mon.events.PY_START, on_start)
+        mon.register_callback(tool, mon.events.PY_RETURN, on_return)
+        out = {}
+        try:
+            for member in Dialects:
+                cur.clear()
+                mon.set_events(tool, mon.events.PY_START | mon.events.PY_RETURN)
+                dialect = Dialect.get_or_raise(member)
+                for _ in range(3):
+                    dialect.generator()
+                mon.set_events(tool, 0)
+                classes(type(dialect))
+                for attr in vars(type(dialect)).values():
+                    if isinstance(attr, type):
+                        classes(attr)
+                for name in ("generator_class", "tokenizer_class", "parser_class", "jsonpath_tokenizer_class"):
+                    classes(getattr(dialect, name, None))
+                out[member.value] = sorted(cur)
+        finally:
+            mon.set_events(tool, 0)
+            mon.free_tool_id(tool)
         return out
 
     return fork_call(job, timeout)

@@ -51,7 +51,9 @@ def main():
         check(state, names, imports, set(unstable))
     as_object = state.modules_used_as_objects(
         [os.path.join(root, "sqlglot"), os.path.join(root, "tests")], names)
-    out = {"modules": names, "imports": imports, "unstable": unstable, "as_object": as_object}
+    out = {"modules": names, "imports": imports, "unstable": unstable, "as_object": as_object,
+           # every import statement, also those inside functions (Selector.loop_slice)
+           "imports_all": state.static_imports(root, names, nested=True)}
     raw = json.dumps(out, separators=(",", ":")).encode()
     with open(out_path, "wb") as f:
         f.write(zlib.compress(raw, 9))
