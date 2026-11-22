@@ -234,6 +234,40 @@ def _kept_method(case, meth: str, spans):
     return namespace[owner].__dict__[meth]
 
 
+# test id -> [(old text, new text)]: a scaled-down stand-in for an expensive test, made by
+# replacing these pieces of the test method's source (each has to occur exactly once). What
+# such a run shows is evidence about the real test, not its verdict (see main.evidence_probe).
+SCALE_TESTS: dict[str, list] = {}
+
+
+def _scaled_method(case, meth: str, replacements):
+    """The test method recompiled from its source with the given replacements."""
+    import inspect
+    import textwrap
+
+    func = getattr(type(case), meth)
+    if inspect.unwrap(func) is not func or not inspect.isfunction(func):
+        return None
+    code = func.__code__
+    fdef = find_function(code.co_filename, meth, code.co_firstlineno)
+    if fdef is None or fdef.decorator_list:
+        return None
+    lines = _SOURCE_LINES.get(code.co_filename)
+    if lines is None:
+        with open(code.co_filename, encoding="utf-8") as f:
+            lines = _SOURCE_LINES[code.co_filename] = f.read().split("\n")
+    src = "\n".join(lines[fdef.lineno - 1:fdef.end_lineno]) + "\n"
+    for old, new in replacements:
+        if src.count(old) != 1:
+            return None     # the method no longer looks like the one the stand-in was written for
+        src = src.replace(old, new)
+    owner = func.__qualname__.split(".")[-2] if "." in func.__qualname__ else type(case).__name__
+    body = textwrap.indent(textwrap.dedent(src), "    ")
+    namespace: dict = {}
+    exec(compile(f"class {owner}:\n{body}", code.co_filename, "exec"), func.__globals__, namespace)
+    return namespace[owner].__dict__[meth]
+
+
 def find_function(filename: str, name: str, first_line: int):
     """The ast.FunctionDef called `name` that starts at `first_line` of the file."""
     import ast
@@ -254,6 +288,17 @@ def load_case(test_id: str):
     mod_name = file_part[:-3].replace("/", ".")
     module = __import__(mod_name, fromlist=[cls_name])
     case = getattr(module, cls_name)(meth)
+    scale = SCALE_TESTS.get(test_id)
+    if scale:
+        scaled = None
+        try:
+            scaled = _scaled_method(case, meth, scale)
+        except Exception:  # noqa: BLE001
+            scaled = None
+        if scaled is None:
+            raise LightUnavailable(test_id)
+        setattr(case, meth, types.MethodType(scaled, case))
+        return case
     keep = KEEP_STATEMENTS.get(test_id)
     if keep is not None:
         kept = None
@@ -275,11 +320,225 @@ def load_case(test_id: str):
         if light is None:
             raise LightUnavailable(test_id)
         setattr(case, meth, types.MethodType(light, case))
+    only = LOOP_SLICE.get(test_id)
+    if only is not None and test_id in LOOP_RECIPES:
+        setattr(case, meth, types.MethodType(
+            lambda self, _run=_sliced_loop(getattr(case, meth), LOOP_RECIPES[test_id], only): _run(self), case))
+    spec = PHASED.get(test_id)
+    if spec is not None and test_id in PHASE_RECIPES:
+        setattr(case, meth, types.MethodType(
+            lambda self, _run=_phased_method(getattr(case, meth), spec, PHASE_RECIPES[test_id], test_id): _run(self),
+            case))
     return case
 
 
 class LightUnavailable(Exception):
     pass
+
+
+# -- a test that does the same thing once per dialect ---------------------------------------
+# TestGenerator.test_generator_memory builds a thousand generators of every dialect and
+# watches the memory. One round of its loop touches the classes and modules of one dialect
+# family and the code they share; a patch outside what a round touches cannot change that
+# round (main.Selector.loop_slice works out which rounds a patch can reach). The test is then
+# run with the name its loop walks bound to those members only.
+LOOP_RECIPES = {
+    "tests/test_generator.py::TestGenerator::test_generator_memory": {"name": "Dialects"},
+}
+# test id -> values of the enumeration's members to keep
+LOOP_SLICE: dict[str, list] = {}
+
+
+def _sliced_loop(orig, recipe: dict, only):
+    def run(self):
+        module = sys.modules[type(self).__module__]
+        whole = getattr(module, recipe["name"])
+        keep = set(only)
+        setattr(module, recipe["name"], [m for m in whole if m.value in keep])
+        try:
+            return orig()
+        finally:
+            setattr(module, recipe["name"], whole)
+
+    return run
+
+
+# -- settling the executor's TPC tests in two phases -------------------------------------------
+# TestExecutor.test_execute_tpcds / test_execute_tpch do, for every query of a fixture file:
+# parse it, send the expression to a pool worker, and there execute() it: optimize, plan, run
+# the plan in the Python executor; back in the test the rows are compared with DuckDB's.
+# Running the plans is most of the cost. For one query, everything after the optimizer sees
+# the patched program through two values only, the parsed and the optimized expression. If both
+# are what they are on the pinned commit, and the patch touches no line that the query runs
+# outside parsing and optimizing (measured with nothing but the pinned optimized expression
+# to start from: tools/tracer/phases.py), the rest is unchanged code on unchanged input and
+# the query passes as it does on the pinned commit. Such queries are taken out; the test
+# runs on the others, or not at all when none is left.
+PHASE_RECIPES = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds":
+        {"sqls": "tpcds_sqls", "tables": "tpcds_tables", "schema": "TPCDS_SCHEMA",
+         "file": "optimizer/tpc-ds/tpc-ds.sql"},
+    "tests/test_executor.py::TestExecutor::test_execute_tpch":
+        {"sqls": "tpch_sqls", "tables": "tpch_tables", "schema": "TPCH_SCHEMA",
+         "file": "optimizer/tpc-h/tpc-h.sql"},
+}
+# test id -> {"fp": {entry: [parsed, optimized]}, "eligible": [entries], "cost": {entry: cpu s},
+#             "max_exec": cpu s that may be spent executing the entries that are left}
+PHASED: dict[str, dict] = {}
+# what the two-phase runs did: test id -> [entries looked at, entries left, entries executed]
+PHASE_LOG: dict[str, list] = {}
+
+
+class PlanReached(BaseException):
+    """Raised in place of building the plan: the optimized expression has been seen."""
+
+
+def expr_fingerprint(expression) -> str:
+    """A digest of everything an expression tree holds (classes, arguments, types, comments, meta)."""
+    import hashlib
+    import json
+
+    from sqlglot import serde
+
+    return hashlib.sha1(json.dumps(serde.dump(expression), default=repr, sort_keys=True).encode()).hexdigest()[:20]
+
+
+def executor_phase_one(te, sql: str, meta: dict, keep_optimized: list | None = None) -> list:
+    """What one query of an executor TPC test looks like up to the plan: [digest of the parsed
+    expression as the worker receives it, digest of the optimized expression (None for a query
+    the test does not execute)]. sqlglot.executor.Plan must be the stub of `plan_stub`."""
+    parsed = pickle.loads(pickle.dumps(te.parse_one(sql)))
+    out = [expr_fingerprint(parsed), None]
+    _PHASE_BOX.clear()
+    try:
+        te.mp_execute(parsed, meta)
+    except PlanReached:
+        out[1] = _PHASE_BOX.get("fp")
+        if keep_optimized is not None:
+            keep_optimized.append(_PHASE_BOX.get("expression"))
+    return out
+
+
+_PHASE_BOX: dict = {}
+
+
+def plan_stub(expression):
+    _PHASE_BOX["fp"] = expr_fingerprint(expression)
+    _PHASE_BOX["expression"] = expression
+    raise PlanReached()
+
+
+class _NoRows(dict):
+    """Stands in for the tables of the class fixture while queries are only parsed and
+    optimized: every name is a table without rows (the optimizer is given the schema, not
+    the tables)."""
+
+    def __missing__(self, name):
+        from sqlglot.executor.table import Table
+
+        return Table()
+
+
+def _phased_method(orig, spec: dict, recipe: dict, test_id: str):
+    def run(self):
+        import sqlglot.executor as ex
+
+        cls = type(self)
+        te = sys.modules[cls.__module__]
+        built = recipe["sqls"] in cls.__dict__          # was the class fixture built?
+        if built:
+            sqls = getattr(cls, recipe["sqls"])
+        else:
+            # the queries as the fixture would load them (the loader honours FIXTURE_FILTER)
+            sqls = list(sys.modules["tests.helpers"].load_sql_fixture_pairs(recipe["file"]))
+        keep = FIXTURE_FILTER.get(recipe["file"])
+        index = sorted(keep) if keep is not None else list(range(len(sqls)))
+        if len(index) != len(sqls):
+            UNVERIFIED.append(test_id)      # the fixture was not loaded the way it was asked for
+            return
+        eligible = set(spec["eligible"])
+        cost = spec.get("cost", {})
+        limit = spec.get("max_exec", 0.0)
+        max_cpu = spec.get("max_cpu")
+        max_differ = spec.get("max_differ", 6)
+        t0 = _cpu_now()
+        log = PHASE_LOG[test_id] = [0, 0, 0]    # looked at, different (or to be run anyway), run
+
+        def must_run(pos) -> bool:
+            return index[pos] not in eligible or spec["fp"].get(str(index[pos])) is None
+
+        # -- the looks: no table is needed to parse and optimize a query
+        todo = [pos for pos in range(len(sqls)) if must_run(pos)]
+        owed = sum(cost.get(str(index[pos]), 0.5) for pos in todo)
+        log[1] = len(todo)
+        if owed > limit or len(todo) > max_differ:
+            UNVERIFIED.append(test_id)
+            return
+        te.initializer(getattr(te, recipe["schema"]), getattr(cls, recipe["tables"]) if built else _NoRows())
+        real_plan = ex.Plan
+        ex.Plan = plan_stub
+        try:
+            for pos, (meta, sql, _) in enumerate(sqls):
+                if must_run(pos):
+                    continue
+                if max_cpu is not None and _cpu_now() - t0 > max_cpu:
+                    UNVERIFIED.append(test_id)  # far slower than on the pinned commit: not settled
+                    return
+                log[0] += 1
+                try:
+                    got = executor_phase_one(te, sql, meta)
+                except BaseException as e:  # noqa: BLE001 - whatever it is, the real run will show it
+                    if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    got = None
+                want = list(spec["fp"][str(index[pos])])
+                if got == want or (want[0] == "*" and got is not None and got[1] is None):
+                    continue                # does what it does on the pinned commit
+                todo.append(pos)
+                log[1] += 1
+                owed += cost.get(str(index[pos]), 0.5)
+                # When the optimizer gives the first queries, or many of them, another shape,
+                # looking is no shortcut: the test stays unsettled (and selected).
+                many = (log[1] >= 2 and 4 * log[1] > log[0]) or log[1] > max_differ
+                if owed > limit or many:
+                    UNVERIFIED.append(test_id)
+                    return
+        finally:
+            ex.Plan = real_plan
+        if not todo:
+            return                          # every affected query does what it does on the pinned commit
+        # -- the few queries that differ are run the way the test runs them, one at a time
+        if not built:
+            # (run_tests put a stand-in in place of the fixture this group asked to skip)
+            real = cls.__dict__.get("_br_fixture")
+            if real is not None and real[0] is not None:
+                real[0].__get__(None, cls)()
+            else:
+                cls.setUpClass()
+            full = getattr(cls, recipe["sqls"], None)
+            if full is None:
+                UNVERIFIED.append(test_id)
+                return
+            if len(full) != len(sqls):
+                UNVERIFIED.append(test_id)
+                return
+            sqls = full
+        te.initializer(getattr(te, recipe["schema"]), getattr(cls, recipe["tables"]))
+        for pos in sorted(todo, key=lambda q: (cost.get(str(index[q]), 0.5), q)):
+            if max_cpu is not None and _cpu_now() - t0 > max_cpu + limit:
+                UNVERIFIED.append(test_id)
+                return
+            log[2] += 1
+            setattr(cls, recipe["sqls"], [sqls[pos]])
+            try:
+                orig()
+            finally:
+                setattr(cls, recipe["sqls"], sqls)
+            outcome = getattr(self, "_outcome", None)
+            if outcome is not None and not getattr(outcome, "success", True):
+                return                      # a query fails: so does the test
+
+    return run
 
 
 class _Result:
